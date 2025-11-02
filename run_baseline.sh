@@ -6,7 +6,7 @@ mkdir -p "$RESULTS_DIR"
 LOGDIR="./logs"
 mkdir -p "$LOGDIR"
 
-NUM_CLIENTS=2
+NUM_CLIENTS=4
 DURATION=60  # seconds
 SERVER_LOG="$RESULTS_DIR/server.log"
 

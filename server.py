@@ -381,17 +381,18 @@ async def run_server(host='127.0.0.1', port=9999):
     return transport, proto
 
 if __name__ == "__main__":
+    import argparse, asyncio, logging
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--clients", nargs="+", help="List of client addresses host:port", required=False)
     parser.add_argument("--rate", type=float, default=20.0, help="Snapshot rate (Hz)")
-    parser.add_argument("--duration", type=int, default=60, help="Run duration (seconds)")
+    parser.add_argument("--duration", type=int, help="Run duration (seconds). Omit for continuous run.")
     parser.add_argument("--log", type=str, default="server.log", help="Log file path")
     args = parser.parse_args()
 
     logging.basicConfig(filename=args.log, level=logging.INFO, format="%(asctime)s %(message)s")
     print(f"[SERVER] Logging to {args.log}")
-    print(f"[SERVER] Clients: {args.clients}")
+    print(f"[SERVER] Clients: {args.clients or 'None (waiting for clients)'}")
 
     loop = asyncio.get_event_loop()
     transport, proto = loop.run_until_complete(run_server())
@@ -402,15 +403,22 @@ if __name__ == "__main__":
     loop.create_task(proto.cleanup_fragments_periodically())
     loop.create_task(proto.periodic_acked_snapshots_cleanup())
 
-    # Run for the specified duration
-    async def stop_after():
-        await asyncio.sleep(args.duration)
-        transport.close()
-        loop.stop()
-        print("[SERVER] Test duration ended, server stopped")
+    # Only stop if duration was given
+    if args.duration:
+        async def stop_after():
+            await asyncio.sleep(args.duration)
+            transport.close()
+            loop.stop()
+            print("[SERVER] Test duration ended, server stopped")
 
-    loop.create_task(stop_after())
+        loop.create_task(stop_after())
+        print(f"[SERVER] Running for {args.duration} seconds...")
+    else:
+        print("[SERVER] Running in continuous mode (Ctrl+C to stop)")
+
     try:
         loop.run_forever()
     except KeyboardInterrupt:
-        pass
+        print("\n[SERVER] Stopped by user.")
+        transport.close()
+        loop.stop()
