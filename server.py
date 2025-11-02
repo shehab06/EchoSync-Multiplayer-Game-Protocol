@@ -387,10 +387,11 @@ if __name__ == "__main__":
     parser.add_argument("--clients", nargs="+", help="List of client addresses host:port", required=False)
     parser.add_argument("--rate", type=float, default=20.0, help="Snapshot rate (Hz)")
     parser.add_argument("--duration", type=int, help="Run duration (seconds). Omit for continuous run.")
-    parser.add_argument("--log", type=str, default="server.log", help="Log file path")
+    parser.add_argument("--log", type=str, help="Log file path", required=False)
     args = parser.parse_args()
-
-    logging.basicConfig(filename=args.log, level=logging.INFO, format="%(asctime)s %(message)s")
+    
+    if  args.log:
+        logging.basicConfig(filename=args.log, level=logging.INFO, format="%(asctime)s %(message)s")
     print(f"[SERVER] Logging to {args.log}")
     print(f"[SERVER] Clients: {args.clients or 'None (waiting for clients)'}")
 

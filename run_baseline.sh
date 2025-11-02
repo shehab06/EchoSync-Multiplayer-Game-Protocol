@@ -1,14 +1,11 @@
 #!/bin/bash
 # run_baseline.sh - Phase 1 baseline test
 set -e
-RESULTS_DIR="./results/baseline"
-mkdir -p "$RESULTS_DIR"
 LOGDIR="./logs"
 mkdir -p "$LOGDIR"
 
 NUM_CLIENTS=4
 DURATION=60  # seconds
-SERVER_LOG="$RESULTS_DIR/server.log"
 
 echo "[TEST] Baseline test: results -> $RESULTS_DIR, duration ${DURATION}s, clients ${NUM_CLIENTS}"
 
@@ -20,7 +17,7 @@ done
 
 # Start server
 python3 -m pip install -r requirements.txt
-python3 server.py --clients $CLIENT_ADDRS --rate 20 --duration $DURATION --log "$SERVER_LOG" > "$LOGDIR/server_stdout.log" 2>&1 &
+python3 server.py --clients $CLIENT_ADDRS --rate 20 --duration $DURATION 2>&1 &
 SERVER_PID=$!
 echo "[TEST] server pid=$SERVER_PID"
 
@@ -45,4 +42,4 @@ for pid in "${CLIENT_PIDS[@]}"; do
   kill $pid 2>/dev/null || true
 done
 
-echo "[TEST] Baseline finished. Files in $RESULTS_DIR. Server log: $SERVER_LOG"
+echo "[TEST] Baseline finished. Files in $RESULTS_DIR."
