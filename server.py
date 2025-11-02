@@ -1,346 +1,376 @@
-"""
-Grid Clash authoritative UDP server.
+from ESP_config import *
+import time, asyncio, random
+from collections import defaultdict
+from typing import Dict, Tuple
 
-Features:
-- UDP transport with binary header per spec.
-- Broadcasts redundant snapshots (last K) at BROADCAST_FREQ_HZ.
-- Accepts ACQUIRE_REQUEST events from clients and resolves conflicts.
-- Sends EVENT messages for acquisition results and retransmits them until clients ACK the event (selective reliability).
-- Maintains grid state and logs simple metrics.
-Usage: python server.py
-"""
-
-import asyncio
-import struct
-import time
-import zlib
-import json
-from collections import deque, defaultdict, namedtuple
-from dataclasses import dataclass, field
-from typing import Dict, Tuple, Deque, List
-
-# -----------------------------
-# Protocol constants / header
-# -----------------------------
-PROTOCOL_ID = b'GSS1'  # 4 bytes ASCII
-VERSION = 1
-MSG_SNAPSHOT = 1
-MSG_EVENT = 2            # server -> clients: event results (e.g., CELL_ACQUIRED)
-MSG_ACK = 3              # client -> server: ack snapshot or ack event (payload defines)
-MSG_REGISTER = 4         # client -> server: register with player_id
-MSG_ACQUIRE_REQ = 5      # client -> server: acquire request (treated as EVENT inbound)
-
-# Header: protocol_id (4s -> 4-byte string), version (B -> unsigned char 1 byte), msg_type (B -> unsigned char 1 byte), snapshot_id (I -> unsigned int 4 bytes), seq_num (I -> unsigned int 4 bytes), server_timestamp (Q -> unsigned long long 8 bytes), payload_len (H -> unsigned short 2 bytes), checksum (I -> unsigned int 4 bytes)
-HEADER_FMT = "!4s B B I I Q H I" # !-> Network (big-endian)
-HEADER_SIZE = struct.calcsize(HEADER_FMT) # should be 28 bytes
-MAX_PACKET = 1200 # bytes
-SNAPSHOT_PAYLOAD_LIMIT = MAX_PACKET - HEADER_SIZE
-
-# Config
-BROADCAST_FREQ_HZ = 20        # 20 snapshots/sec
-REDUNDANT_K = 3               # include last K snapshots per packet
-GRID_N = 20                   # 20x20 grid
-TOTAL_CELLS = GRID_N * GRID_N
-MAX_CLIENTS = 16
-
-# Event / cell formats
-# ACQUIRE_REQUEST (client->server): event_id (I), player_id (I), cell_idx (I), client_ts_ms (Q)
-ACQUIRE_REQ_FMT = "!I I I Q"
-ACQUIRE_REQ_SIZE = struct.calcsize(ACQUIRE_REQ_FMT)
-
-# EVENT result (server->clients): event_id (I), cell_idx (I), owner_player_id (I), server_ts_ms (Q)
-EVENT_RESULT_FMT = "!I I I Q"
-EVENT_RESULT_SIZE = struct.calcsize(EVENT_RESULT_FMT)
-
-# snapshot payload encoding:
-# We'll send delta snapshots: list of changed cells since last full snapshot.
-# For each snapshot block in payload: meta_len(4) + meta_json + num_changes(2) + repeated (cell_idx (I), owner (I))
-CELL_CHANGE_FMT = "!I I"
-CELL_CHANGE_SIZE = struct.calcsize(CELL_CHANGE_FMT)
-
-@dataclass
-class ClientInfo:
-    addr: Tuple[str, int]
-    player_id: int = 0
-    last_ack_snapshot: int = 0
-    last_ack_event: int = 0      # up to which event id they acked (or highest acked)
-    last_seq: int = 0
-
-@dataclass
-class Snapshot:
-    snapshot_id: int
-    seq_num: int
-    timestamp_ms: int
-    # represent changes as list of tuples (cell_idx, owner_player_id)
-    changes: List[Tuple[int, int]]
-
-@dataclass
-class PendingEvent:
-    event_id: int
-    cell_idx: int
-    owner_player_id: int
-    server_ts_ms: int
-    # track which clients have acked
-    acked_by: set = field(default_factory=set)
-    last_sent_ms: float = 0.0
-    send_count: int = 0
-
-class GridServerProtocol:
-    def __init__(self, host='0.0.0.0', port=9999):
-        self.host = host
-        self.port = port
+# ====== Server Implementation ======
+class ESPServerProtocol:
+    def __init__(self, loop):
+        self.loop = loop
         self.transport = None
-        self.loop = asyncio.get_event_loop()
+        self.fragment_manager = FragmentManager()
+        
+        self.next_player_id = 1
+        self.players: Dict[int, PlayerRoomInfo] = {}  # player_id -> PlayerRoomInfo
+        self.addr_to_player: Dict[Tuple[str, int], int] = {}  # addr -> player_id
+        
+        self.next_room_id = 1
+        self.rooms: Dict[int, Room] = {}  # room_id -> Room
+        self.player_room: Dict[int, int] = {}  # player_id -> room_id
+        
+        self.next_id = 1
+        self.next_seq: Dict[int, int] = {}
+        
+        self.snapshot_buffer = {}  # (seq, player_id) -> {'packet':bytes, 'last_sent':time, 'sent_count':int}
+        self.acked_snapshots = defaultdict(set)  # player_id -> set(seq)
 
-        self.clients: Dict[Tuple[str,int], ClientInfo] = {}
-        self.player_addrs: Dict[int, Tuple[str,int]] = {}
-
-        self.grid = [0] * TOTAL_CELLS  # 0 = unclaimed, else player_id
-        self.next_snapshot_id = 1
-        self.next_seq = 1
-        self.snapshots: Deque[Snapshot] = deque(maxlen=1000)
-
-        self.next_event_id = 1
-        self.pending_events: Dict[int, PendingEvent] = {}  # event_id -> PendingEvent
-
-        # metrics
-        self.packets_sent = 0
-        self.packets_recv = 0
-        self.start_time = time.time()
-
-    def start(self):
-        print(f"Starting GridServer on {self.host}:{self.port}")
-        listen = self.loop.create_datagram_endpoint(lambda: self, local_addr=(self.host, self.port))
-        self.transport, _ = self.loop.run_until_complete(listen)
-        self.loop.create_task(self._broadcast_loop())
-        self.loop.create_task(self._retransmit_loop())
-        try:
-            self.loop.run_forever()
-        except KeyboardInterrupt:
-            print("Shutting down")
-        finally:
-            self.transport.close()
-
-    # DatagramProtocol callbacks
+    # Datagram Protocol Methods
     def connection_made(self, transport):
         self.transport = transport
-        print("UDP socket ready")
+        print("Server listening")
 
     def datagram_received(self, data, addr):
-        self.packets_recv += 1
-        if len(data) < HEADER_SIZE:
-            print("Undersized packet from", addr); return
-        header = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
-        protocol_id, version, msg_type, snapshot_id, seq_num, ts, payload_len, checksum = header
-        if protocol_id != PROTOCOL_ID:
-            # ignore non-matching protocol
+        pkt = parse_packet(data)
+        if pkt is None:
             return
-        payload = data[HEADER_SIZE:HEADER_SIZE+payload_len]
-        computed = zlib.crc32(data[:HEADER_SIZE-4] + payload) & 0xffffffff
-        if computed != checksum:
-            print("Checksum mismatch from", addr); return
 
-        if msg_type == MSG_REGISTER:
-            self._handle_register(payload, addr)
-        elif msg_type == MSG_ACQUIRE_REQ:
-            self._handle_acquire_request(payload, addr)
-        elif msg_type == MSG_ACK:
-            self._handle_ack(payload, addr)
+        payload = self.fragment_manager.add_fragment(addr, pkt['id'], pkt['seq'], pkt['payload_len'], pkt['payload'])
+        if payload is None:
+            return  # waiting for more fragments
+        pkt['payload'] = payload
+        
+        t = pkt['msg_type']
+        if t == MESSAGE_TYPES['INIT']:
+            self.handle_init(pkt, addr)
+        elif t == MESSAGE_TYPES['CREATE_ROOM']:
+            self.handle_create_room(pkt, addr)
+        elif t == MESSAGE_TYPES['JOIN_ROOM']:
+            self.handle_join_room(pkt, addr)
+        elif t == MESSAGE_TYPES['LEAVE_ROOM']:
+            self.handle_leave_room(pkt, addr)
+        elif t == MESSAGE_TYPES['LIST_ROOMS']:
+            self.handle_list_rooms(pkt, addr)
+        elif t == MESSAGE_TYPES['EVENT']:
+            self.handle_event(pkt, addr)
+        elif t == MESSAGE_TYPES['SNAPSHOT_ACK']:
+            self.handle_snapshot_ack(pkt, addr)
+        elif t == MESSAGE_TYPES['DISCONNECT']:
+            self.handle_disconnect(pkt, addr)
         else:
-            print("Unknown msg_type", msg_type, "from", addr)
+            # ignore clients won't send INIT_ACK, CREATE_ACK, JOIN_ACK, LIST_ROOMS_ACK, SNAPSHOT or unknown message type
+            pass
+    
+    def connection_lost(self, exc):
+        print("Connection lost:", exc)
 
-    def _handle_register(self, payload: bytes, addr):
-        # payload is JSON {"player_id": int}
-        try:
-            info = json.loads(payload.decode())
-            pid = int(info.get("player_id"))
-        except Exception as e:
-            print("Bad register payload", e); return
-        if addr not in self.clients:
-            self.clients[addr] = ClientInfo(addr=addr, player_id=pid)
-            self.player_addrs[pid] = addr
-            print(f"Registered player {pid} from {addr}. total clients={len(self.clients)}")
-        else:
-            self.clients[addr].player_id = pid
-            self.player_addrs[pid] = addr
-            print(f"Re-registered player {pid} from {addr}")
-
-    def _handle_acquire_request(self, payload: bytes, addr):
-        # parse ACQUIRE_REQ_FMT
-        if len(payload) < ACQUIRE_REQ_SIZE:
-            return
-        self.packets_recv += 0
-        event_id, player_id, cell_idx, client_ts_ms = struct.unpack(ACQUIRE_REQ_FMT, payload[:ACQUIRE_REQ_SIZE])
-        # defensive: clamp
-        if not (0 <= cell_idx < TOTAL_CELLS):
-            return
-        # resolve: if unclaimed -> grant, else ignore
-        # conflict resolution: first-come wins at server; client timestamp used as tie-breaker only if simultaneous arrival (rare)
-        current_owner = self.grid[cell_idx]
-        granted = False
-        if current_owner == 0:
-            # grant it immediately to this player
-            self.grid[cell_idx] = player_id
-            granted = True
-        else:
-            # already owned, no change
-            granted = False
-
-        # record an event result (server will broadcast)
-        eid = self.next_event_id
-        self.next_event_id += 1
-        srv_ts = int(time.time() * 1000)
-        ev = PendingEvent(event_id=eid, cell_idx=cell_idx, owner_player_id=(player_id if granted else current_owner),
-                          server_ts_ms=srv_ts)
-        self.pending_events[eid] = ev
-
-        # Also create a snapshot including this change to include in next broadcast (we append snapshot now)
-        # For snapshot change we send only this cell change
-        snap = Snapshot(snapshot_id=self.next_snapshot_id, seq_num=self.next_seq, timestamp_ms=int(time.time()*1000),
-                        changes=[(cell_idx, self.grid[cell_idx])])
-        self.snapshots.appendleft(snap)
-        self.next_snapshot_id += 1
-        self.next_seq += 1
-
-        # send an immediate EVENT packet to all clients so critical event propagates faster (server->clients)
-        self._broadcast_event(ev)
-
-    def _handle_ack(self, payload: bytes, addr):
-        # ACK payload: type byte (1 = snapshot ack, 2 = event ack) followed by ack id (I)
-        if len(payload) < 5:
-            return
-        ack_type = payload[0]
-        (ack_id,) = struct.unpack_from("!I", payload, 1)
-        client = self.clients.get(addr)
-        if not client:
-            return
-        if ack_type == 1:
-            # snapshot ack
-            client.last_ack_snapshot = max(client.last_ack_snapshot, ack_id)
-        elif ack_type == 2:
-            # event ack
-            # mark pending event acked by this client
-            pe = self.pending_events.get(ack_id)
-            if pe:
-                pe.acked_by.add(client.player_id)
-            client.last_ack_event = max(client.last_ack_event, ack_id)
-
-    async def _broadcast_loop(self):
-        period = 1.0 / BROADCAST_FREQ_HZ
-        while True:
-            start = self.loop.time()
-            # create periodic snapshot summarizing recent changes if any
-            # For continuous operation, we will send an empty snapshot (no changes) occasionally so clients know time advanced.
-            snap_changes = []  # for simplicity, send aggregated changes since last snapshot creation
-            # here we don't compute diffs; we will send the most recent snapshots kept in self.snapshots
-            self._broadcast_snapshots()
-            elapsed = self.loop.time() - start
-            await asyncio.sleep(max(0, period - elapsed))
-
-    def _pack_and_send(self, msg_type: int, payload: bytes, snapshot_id=0, seq_num=0):
-        header = struct.pack(HEADER_FMT,
-                             PROTOCOL_ID,
-                             VERSION,
-                             msg_type,
-                             snapshot_id,
-                             seq_num,
-                             int(time.time() * 1000),
-                             len(payload),
-                             0)
-        checksum = zlib.crc32(header[:HEADER_SIZE-4] + payload) & 0xffffffff
-        header = struct.pack(HEADER_FMT,
-                             PROTOCOL_ID,
-                             VERSION,
-                             msg_type,
-                             snapshot_id,
-                             seq_num,
-                             int(time.time() * 1000),
-                             len(payload),
-                             checksum)
-        packet = header + payload
-        # send to all clients
-        for addr in list(self.clients.keys()):
-            try:
-                self.transport.sendto(packet, addr)
-                self.packets_sent += 1
-            except Exception as e:
-                print("Send error to", addr, e)
-
-    def _broadcast_snapshots(self):
-        # include up to REDUNDANT_K latest snapshots in payload (oldest-first in payload)
-        latest_snaps = list(self.snapshots)[:REDUNDANT_K]
-        # build payload: for each snapshot -> 4bytes meta_len + meta_json + 2bytes num_changes + changes...
-        total_payload = bytearray()
-        for snap in reversed(latest_snaps):  # oldest first
-            meta = json.dumps({"snapshot_id": snap.snapshot_id, "seq_num": snap.seq_num, "ts": snap.timestamp_ms}).encode()
-            total_payload.extend(struct.pack("!I", len(meta)))
-            total_payload.extend(meta)
-            # number of changes
-            total_payload.extend(struct.pack("!H", len(snap.changes)))
-            for cell_idx, owner in snap.changes:
-                total_payload.extend(struct.pack(CELL_CHANGE_FMT, cell_idx, owner))
-
-        if len(total_payload) > SNAPSHOT_PAYLOAD_LIMIT:
-            # If too big, trim older snapshots until fit
-            while len(total_payload) > SNAPSHOT_PAYLOAD_LIMIT and len(latest_snaps) > 1:
-                latest_snaps.pop(0)
-                total_payload = bytearray()
-                for snap in reversed(latest_snaps):
-                    meta = json.dumps({"snapshot_id": snap.snapshot_id, "seq_num": snap.seq_num, "ts": snap.timestamp_ms}).encode()
-                    total_payload.extend(struct.pack("!I", len(meta)))
-                    total_payload.extend(meta)
-                    total_payload.extend(struct.pack("!H", len(snap.changes)))
-                    for cell_idx, owner in snap.changes:
-                        total_payload.extend(struct.pack(CELL_CHANGE_FMT, cell_idx, owner))
-            if len(total_payload) > SNAPSHOT_PAYLOAD_LIMIT:
-                # still too big; truncate change lists per snapshot (not fully implemented)
-                total_payload = total_payload[:SNAPSHOT_PAYLOAD_LIMIT]
-
-        payload_bytes = bytes(total_payload)
-        # snapshot_id in header: most recent snapshot id if available
-        head_snap_id = latest_snaps[-1].snapshot_id if latest_snaps else 0
-        self._pack_and_send(MSG_SNAPSHOT, payload_bytes, snapshot_id=head_snap_id, seq_num=self.next_seq)
-
-    def _broadcast_event(self, pending_event: PendingEvent):
-        # EVENT payload: EVENT_RESULT_FMT (event_id, cell_idx, owner_id, server_ts)
-        payload = struct.pack(EVENT_RESULT_FMT, pending_event.event_id, pending_event.cell_idx,
-                              pending_event.owner_player_id, pending_event.server_ts_ms)
-        # send to all clients
-        self._pack_and_send(MSG_EVENT, payload, snapshot_id=self.next_snapshot_id - 1, seq_num=self.next_seq)
-        pending_event.last_sent_ms = time.time()
-        pending_event.send_count += 1
-
-    async def _retransmit_loop(self):
-        # retransmit pending events every RETRANSMIT_INTERVAL for clients that haven't acked them
-        RETRANSMIT_INTERVAL = 0.5  # seconds
-        while True:
-            now = time.time()
-            to_delete = []
-            for eid, pe in list(self.pending_events.items()):
-                # if all connected clients acked it, remove it
-                all_acked = True
-                for c in self.clients.values():
-                    if c.player_id not in pe.acked_by:
-                        all_acked = False; break
-                if all_acked:
-                    to_delete.append(eid)
-                    continue
-                # else, retransmit if last sent older than interval
-                if now - pe.last_sent_ms >= RETRANSMIT_INTERVAL:
-                    self._broadcast_event(pe)
-            for eid in to_delete:
-                del self.pending_events[eid]
-            await asyncio.sleep(RETRANSMIT_INTERVAL)
-            
     def pause_writing(self):
         pass
 
     def resume_writing(self):
         pass
     
-    def error_received(self, exc):
-        print("Error received:", exc)
+    # Handlers
+    def handle_init(self, pkt, addr):
+        self.players[self.next_player_id] = PlayerRoomInfo(address=addr, room_id=0, player_local_id=0)
+        self.addr_to_player[addr] = self.next_player_id
+        self.next_seq[self.next_player_id] = 1
+        payload = build_init_ack_payload(pkt['id'], self.next_player_id)
+        pkts, seq_num = build_packet(MESSAGE_TYPES['INIT_ACK'], pkt_id=self.next_id, start_seq=self.next_seq[self.next_player_id], payload=payload)
+        for p in pkts:
+            self.transport.sendto(p, addr)
+        print(f"Connected player {self.next_player_id} from {addr}")
+        self.next_seq[self.next_player_id] = seq_num
+        self.next_player_id += 1
+        self.next_id += 1
+        
+    def handle_create_room(self, pkt, addr):
+        
+        player_id = self.addr_to_player.get(addr)
+        if player_id is None:
+            return
+        
+        next_seq = self.next_seq.get(player_id)
+        if next_seq is None:
+            return
+        
+        room_name = parse_create_room_payload(pkt['payload'])
+        if room_name is None:
+            return
+        
+        room_id = self.next_room_id
+        self.rooms[room_id] = Room(room_id=room_id, name=room_name)
+        payload = build_create_ack_payload(pkt['id'], room_id)
+        pkts, seq_num = build_packet(MESSAGE_TYPES['CREATE_ACK'], pkt_id=self.next_id, start_seq=next_seq, payload=payload)
+        for p in pkts:
+            self.transport.sendto(p, addr)
+        print(f"Created room {room_id} named '{room_name}'")
+        self.next_seq[player_id] = seq_num
+        self.next_room_id += 1
+        self.next_id += 1
+        
+    def handle_join_room(self, pkt, addr):
+        room_id = parse_join_room_payload(pkt['payload'])
+        if room_id is None:
+            return
+        
+        room = self.rooms.get(room_id)
+        if room is None:
+            return
+        
+        # find player_id for addr
+        player_id = self.addr_to_player.get(addr)
+        if player_id is None:
+            return
+        
+        next_seq = self.next_seq.get(player_id)
+        if next_seq is None:
+            return
+            
+        # assign local id
+        used_ids = set(room.players.keys())
+        for local_id in range(1, MAX_ROOM_PLAYERS + 1):
+            if local_id not in used_ids:
+                break
+        else:
+            return
+        
+        color = (random.randint(50,255), random.randint(50,255), random.randint(50,255))
+        while any(p.color == color for p in room.players.values()):
+            color = (random.randint(50,255), random.randint(50,255), random.randint(50,255))
+            
+        room.players[local_id] = RoomPlayer(global_id=player_id, color=color)
+        self.players[player_id].room_id = room_id
+        self.players[player_id].player_local_id = local_id
+        
+        self.player_room[player_id] = room_id
+        
+        payload = build_join_ack_payload(pkt['id'], local_id, {lid: (p.global_id, p.color) for lid, p in room.players.items()})
+        pkts, seq_num = build_packet(MESSAGE_TYPES['JOIN_ACK'], pkt_id=self.next_id, start_seq=next_seq, payload=payload)
+        for p in pkts:
+            self.transport.sendto(p, addr)
+        print(f"Player {player_id} joined room {room_id} as local id {local_id}")
+        self.next_seq[player_id] = seq_num
+        self.next_id += 1
+    
+    def handle_leave_room(self, pkt, addr):
+        # find player_id for addr
+        player_id = self.addr_to_player.get(addr)
+        if player_id is None:
+            return
+        
+        next_seq = self.next_seq.get(player_id)
+        if next_seq is None:
+            return
+        
+        room_id = self.player_room.get(player_id)
+        if room_id is None:
+            return
+        
+        room = self.rooms.get(room_id)
+        if room is None:
+            return
+        
+        local_id = self.players[player_id].player_local_id
+        if local_id in room.players:
+            del room.players[local_id]
+        
+        self.players[player_id].room_id = 0
+        self.players[player_id].player_local_id = 0
+        del self.player_room[player_id]
+        
+        payload = b''  # empty payload for LEAVE_ACK
+        pkts, seq_num = build_packet(MESSAGE_TYPES['LEAVE_ACK'], pkt_id=self.next_id, start_seq=next_seq, payload=payload)
+        for p in pkts:
+            self.transport.sendto(p, addr)
+        print(f"Player {player_id} left room {room_id}")
+        self.next_seq[player_id] = seq_num
+        self.next_id += 1
+        
+    def handle_list_rooms(self, pkt, addr):
+        player_id = self.addr_to_player.get(addr)
+        if player_id is None:
+            return
+        
+        next_seq = self.next_seq.get(player_id)
+        if next_seq is None:
+            return
+        
+        rooms_info = {room_id: (len(room.players), room.name) for room_id, room in self.rooms.items()}
+        payload = build_list_rooms_ack_payload(pkt['id'], rooms_info)
+        pkts, seq_num = build_packet(MESSAGE_TYPES['LIST_ROOMS_ACK'], pkt_id=self.next_id, start_seq=next_seq, payload=payload)
+        for p in pkts:
+            self.transport.sendto(p, addr)
+        print(f"Sent room list to {addr}")
+        self.next_seq[player_id] = seq_num
+        self.next_id += 1
+        
+    def handle_event(self, pkt, addr):
+        player_id = self.addr_to_player.get(addr)
+        if player_id is None:
+            return
+        
+        ev = parse_event_payload(pkt['payload'])
+        if ev is None:
+            return
+        event_type, room_id, player_local_id, cell_idx = ev
+        
+        room = self.rooms.get(room_id)
+        if room is None:
+            return
+        
+        if room.players.get(player_local_id) is None:
+            return
+        
+        if event_type == EVENT_TYPES['CELL_ACQUISITION']:
+            self.handle_cell_acquisition(room, player_local_id, cell_idx)
+            
+        
+        for addr, pid in self.addr_to_player.items():
+            next_seq = self.next_seq.get(pid)
+            if next_seq is None:
+                return
+            
+            pkts, seq_num = build_packet(MESSAGE_TYPES['EVENT'], pkt_id=self.next_id, start_seq=next_seq, payload=b'')
+            for p in pkts:
+                for i in range(REDUNDANT_K):
+                    self.transport.sendto(p, addr)
+            self.next_seq[pid] = seq_num
+        self.next_id += 1
+        
+    def handle_cell_acquisition(self, room, player_local_id, cell_idx):
+        if 0 <= cell_idx < TOTAL_CELLS and room.grid[cell_idx] == 0:
+            room.grid[cell_idx] = player_local_id
+
+    def handle_snapshot_ack(self, pkt, addr):
+        # find player_id for addr
+        player_id = self.addr_to_player.get(addr)
+        if player_id is None:
+            return
+        
+        seq = pkt['seq']
+        self.acked_snapshots[player_id].add(seq)
+        
+        # remove from buffer for this player
+        key = (seq, player_id)
+        if key in self.snapshot_buffer:
+            del self.snapshot_buffer[key]
+
+    def handle_disconnect(self, pkt, addr):
+        player_id = self.addr_to_player.get(addr)
+        if player_id:
+            self.cleanup_player(player_id)
+            print(f"Player {player_id} disconnected gracefully")
+
+    # Helper Methods
+    def send_snapshot_to_all(self):
+        for room in self.rooms.values():
+            payload = build_snapshot_payload(room.grid)
+            
+            for player in room.players.values():
+                
+                next_seq = self.next_seq.get(player.global_id)
+                if next_seq is None:
+                    continue
+                
+                pkts, seq_num = build_packet(MESSAGE_TYPES['SNAPSHOT'], self.next_id, start_seq=next_seq, payload=payload)
+                addr = self.players[player.global_id].address
+                for p in pkts:
+                    now = time.time()
+                    self.snapshot_buffer[(self.next_seq[player.global_id], player.global_id)] = {
+                        'packet': p,
+                        'last_sent': now,
+                        'sent_count': 1
+                    }
+                    self.transport.sendto(p, addr)
+                    print(f"Snapshot Semt Player ID:{player.global_id}, Seq_num:{self.next_seq[player.global_id]}")
+                self.next_seq[player.global_id] = seq_num
+        self.next_id += 1
+        
+    def clear_player_acked_snapshots(self, player_id: int) -> None:
+        self.acked_snapshots.pop(player_id, None)
+        keys_to_remove = [k for k in self.snapshot_buffer.keys() if k[1] == player_id]
+        for k in keys_to_remove:
+            del self.snapshot_buffer[k]
+            
+    def cleanup_acked_snapshots_keep_last_n(self, keep_last_n: int = 100) -> None:
+        for player_id, seq_set in list(self.acked_snapshots.items()):
+            if len(seq_set) <= keep_last_n:
+                continue
+            seqs_sorted = sorted(seq_set)
+            to_keep = set(seqs_sorted[-keep_last_n:])
+            self.acked_snapshots[player_id] = to_keep
+  
+    def cleanup_player(self, player_id: int):
+        player = self.players.get(player_id)
+        if not player:
+            return
+
+        # --- 1. Remove from room ---
+        room_id = self.player_room.get(player_id)
+        if room_id and room_id in self.rooms:
+            room = self.rooms[room_id]
+            local_id = player.player_local_id
+            if local_id in room.players:
+                del room.players[local_id]
+            print(f"Removed player {player_id} (local id {local_id}) from room {room_id}")
+
+        # --- 2. Remove mapping ---
+        addr = player.address
+        self.addr_to_player.pop(addr, None)
+        self.player_room.pop(player_id, None)
+
+        # --- 3. Clear network-related state ---
+        self.clear_player_acked_snapshots(player_id)
+        self.fragment_manager.fragments = {k: v for k, v in self.fragment_manager.fragments.items() if k[0] != player_id}
+
+        # --- 4. Remove player object ---
+        del self.players[player_id]
+
+        print(f"✅ Cleaned up player {player_id}")
+
+    # Async Methods
+    async def periodic_snapshots(self):
+        while True:
+            self.send_snapshot_to_all()
+            await asyncio.sleep(SNAPSHOT_INTERVAL)
+
+    async def periodic_retransmit(self):
+        while True:
+            now = time.time()
+            for (seq, player_id), entry in list(self.snapshot_buffer.items()):
+                if now - entry['last_sent'] > RETRANS_TIMEOUT:
+                    pkt_bytes = entry['packet']
+                    addr = self.players[player_id].address
+                    if seq not in self.acked_snapshots[player_id]:
+                        self.transport.sendto(pkt_bytes, addr)
+                    entry['last_sent'] = now
+                    entry['sent_count'] += 1
+            await asyncio.sleep(0.2)
+    
+    async def cleanup_fragments_periodically(self):
+        while True:
+            self.fragment_manager.cleanup()
+            await asyncio.sleep(1.0)
+            
+    async def periodic_acked_snapshots_cleanup(self, keep_last_n: int = 100, interval: float = 60.0):
+        while True:
+            self.cleanup_acked_snapshots_keep_last_n(keep_last_n)
+            await asyncio.sleep(interval)
+
+async def run_server(host='127.0.0.1', port=9999):
+    loop = asyncio.get_event_loop()
+    print("Starting server...")
+    transport, proto = await loop.create_datagram_endpoint(lambda: ESPServerProtocol(loop), local_addr=(host, port))
+    # spawn snapshot broadcaster and retransmit loop
+    loop.create_task(proto.periodic_snapshots())
+    loop.create_task(proto.periodic_retransmit())
+    loop.create_task(proto.cleanup_fragments_periodically())
+    loop.create_task(proto.periodic_acked_snapshots_cleanup())
+    
+    # server runs forever
+    return transport, proto
 
 if __name__ == "__main__":
-    gs = GridServerProtocol(host="127.0.0.1", port=9999)
-    gs.start()
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(run_server())
+    loop.run_forever()
