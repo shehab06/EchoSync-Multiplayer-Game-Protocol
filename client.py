@@ -18,7 +18,6 @@ class ESPClientProtocol:
         self.room_id = None
         self.local_id = None
         self.grid = [0] * TOTAL_CELLS
-        self.fragment_buffer = defaultdict(bytes)
 
     def connection_made(self, transport):
         self.transport = transport
