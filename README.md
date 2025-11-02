@@ -36,5 +36,5 @@ python server.py
 ### 5. Run the client game
 
 ```bash
-python client_pygame.py <player_id>
+python client.py 
 ```

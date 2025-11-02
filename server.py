@@ -1,5 +1,5 @@
 from ESP_config import *
-import time, asyncio, random
+import time, asyncio, random, logging, argparse
 from collections import defaultdict
 from typing import Dict, Tuple
 
@@ -9,6 +9,7 @@ class ESPServerProtocol:
         self.loop = loop
         self.transport = None
         self.fragment_manager = FragmentManager()
+        self.metrics_logger = MetricsLogger()
         
         self.next_player_id = 1
         self.players: Dict[int, PlayerRoomInfo] = {}  # player_id -> PlayerRoomInfo
@@ -253,6 +254,15 @@ class ESPServerProtocol:
         # remove from buffer for this player
         key = (seq, player_id)
         if key in self.snapshot_buffer:
+            pkt = parse_packet(self.snapshot_buffer[key]['packet'])
+            recv_time = time.time()
+            self.metrics_logger.log_snapshot(
+                client_id=player_id,
+                snapshot_id=pkt['id'],
+                seq_num=seq,
+                server_time=pkt['timestamp'],
+                recv_time=recv_time
+            )
             del self.snapshot_buffer[key]
 
     def handle_disconnect(self, pkt, addr):
@@ -371,6 +381,36 @@ async def run_server(host='127.0.0.1', port=9999):
     return transport, proto
 
 if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--clients", nargs="+", help="List of client addresses host:port", required=False)
+    parser.add_argument("--rate", type=float, default=20.0, help="Snapshot rate (Hz)")
+    parser.add_argument("--duration", type=int, default=60, help="Run duration (seconds)")
+    parser.add_argument("--log", type=str, default="server.log", help="Log file path")
+    args = parser.parse_args()
+
+    logging.basicConfig(filename=args.log, level=logging.INFO, format="%(asctime)s %(message)s")
+    print(f"[SERVER] Logging to {args.log}")
+    print(f"[SERVER] Clients: {args.clients}")
+
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(run_server())
-    loop.run_forever()
+    transport, proto = loop.run_until_complete(run_server())
+
+    # Start periodic tasks
+    loop.create_task(proto.periodic_snapshots())
+    loop.create_task(proto.periodic_retransmit())
+    loop.create_task(proto.cleanup_fragments_periodically())
+    loop.create_task(proto.periodic_acked_snapshots_cleanup())
+
+    # Run for the specified duration
+    async def stop_after():
+        await asyncio.sleep(args.duration)
+        transport.close()
+        loop.stop()
+        print("[SERVER] Test duration ended, server stopped")
+
+    loop.create_task(stop_after())
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        pass
