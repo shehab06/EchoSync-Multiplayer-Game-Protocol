@@ -255,7 +255,7 @@ class ESPServerProtocol:
         key = (seq, player_id)
         if key in self.snapshot_buffer:
             pkt = parse_packet(self.snapshot_buffer[key]['packet'])
-            recv_time = time.time()
+            recv_time = time.time_ns()
             self.metrics_logger.log_snapshot(
                 client_id=player_id,
                 snapshot_id=pkt['id'],
@@ -285,7 +285,7 @@ class ESPServerProtocol:
                 pkts, seq_num = build_packet(MESSAGE_TYPES['SNAPSHOT'], self.next_id, start_seq=next_seq, payload=payload)
                 addr = self.players[player.global_id].address
                 for p in pkts:
-                    now = time.time()
+                    now = time.time_ns()
                     self.snapshot_buffer[(self.next_seq[player.global_id], player.global_id)] = {
                         'packet': p,
                         'last_sent': now,
@@ -346,7 +346,7 @@ class ESPServerProtocol:
 
     async def periodic_retransmit(self):
         while True:
-            now = time.time()
+            now = time.time_ns()
             for (seq, player_id), entry in list(self.snapshot_buffer.items()):
                 if now - entry['last_sent'] > RETRANS_TIMEOUT:
                     pkt_bytes = entry['packet']

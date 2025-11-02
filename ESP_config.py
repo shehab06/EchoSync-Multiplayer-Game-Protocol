@@ -132,7 +132,7 @@ class FragmentManager:
 
         frag.frags[seq] = payload
         frag.received_bytes += len(payload)
-        frag.timestamp = time.time()
+        frag.timestamp = time.time_ns()
 
         if frag.received_bytes >= frag.expected_bytes:
             seq_keys = sorted(frag.frags)
@@ -145,7 +145,7 @@ class FragmentManager:
         return None
 
     def cleanup(self):
-        now = time.time()
+        now = time.time_ns()
         expired = [key for key, frag in self.fragments.items()
                    if now - frag.timestamp > self.timeout]
         for key in expired:
@@ -163,11 +163,9 @@ class MetricsLogger:
             "bandwidth_per_client_kbps"
         ]
         # Initialize CSV
-        file_exists = os.path.exists(filename)
-        self.file = open(filename, "a", newline="")
+        self.file = open(filename, "w", newline="")
         self.writer = csv.DictWriter(self.file, fieldnames=self.fieldnames)
-        if not file_exists:
-            self.writer.writeheader()
+        self.writer.writeheader()
 
     def log_snapshot(self, client_id, snapshot_id, seq_num, server_time, recv_time):
         latency = recv_time - server_time
@@ -188,10 +186,10 @@ class MetricsLogger:
             "client_id": client_id,
             "snapshot_id": snapshot_id,
             "seq_num": seq_num,
-            "server_timestamp_ms": int(server_time * 1000),
-            "recv_time_ms": int(recv_time * 1000),
-            "latency_ms": int(latency * 1000),
-            "jitter_ms": int(jitter * 1000),
+            "server_timestamp_ms": int(server_time / 1000000),
+            "recv_time_ms": int(recv_time / 1000000),
+            "latency_ms": int(latency / 1000000),
+            "jitter_ms": int(jitter / 1000000),
             "perceived_position_error": perceived_position_error,
             "cpu_percent": cpu_percent,
             "bandwidth_per_client_kbps": bandwidth_per_client_kbps
@@ -202,7 +200,7 @@ class MetricsLogger:
 """  Helper functions """
 def make_header(msg_type: int, pkt_id: int, seq_num: int, payload_len: int, timestamp: int = None, checksum: int = 0):
     if timestamp is None:
-        timestamp = time.time()
+        timestamp = time.time_ns()
     return struct.pack(HEADER_FMT, PROTOCOL_ID, VERSION, msg_type, pkt_id, seq_num, timestamp, payload_len, checksum)
 
 def compute_checksum(header_bytes: bytes, payload: bytes) -> int:
@@ -214,7 +212,7 @@ def build_packet(msg_type: int, pkt_id: int, start_seq: int, payload: bytes) -> 
 
     # even if payload empty, still make one control packet
     if not payload:
-        ts = int(time.time())
+        ts = int(time.time_ns())
         header = make_header(msg_type, pkt_id, start_seq, 0, timestamp=ts, checksum=0)
         checksum = compute_checksum(header, b"")
         header = struct.pack(
@@ -238,7 +236,7 @@ def build_packet(msg_type: int, pkt_id: int, start_seq: int, payload: bytes) -> 
         end = min(len(payload), start + max_data)
         frag_data = payload[start:end]
 
-        ts = int(time.time())
+        ts = int(time.time_ns())
         header = make_header(msg_type, pkt_id, seq_num, len(frag_data), timestamp=ts, checksum=0)
         checksum = compute_checksum(header, frag_data)
         header = struct.pack(
