@@ -15,13 +15,11 @@ class ESPServerProtocol:
         
         self.next_room_id = 1
         self.rooms: Dict[int, Room] = {}  # room_id -> Room
-        self.player_room: Dict[int, int] = {}  # player_id -> room_id
         
         self.next_id = 1
         self.next_seq: Dict[int, int] = {}
         
         self.snapshot_buffer = {}  # (seq, player_id) -> {'packet':bytes, 'last_sent':time, 'sent_count':int}
-        self.acked_snapshots = defaultdict(set)  # player_id -> set(seq)
 
     # Datagram Protocol Methods
     def connection_made(self, transport):
@@ -80,11 +78,14 @@ class ESPServerProtocol:
         if player_id is None:
             return
         
-        next_seq = self.next_seq.get(player_id)
-        if next_seq is None:
+        if self.next_seq.get(player_id) is None:
             return None
         
-        pkts, seq_num = build_packet(msg_type, self.next_id, self.next_seq[player_id], payload)
+        snapshot_id = 0
+        if (self.players.get(player_id) or self.rooms.get(self.players.get(player_id).room_id)) is not None:
+            snapshot_id = self.rooms.get(self.players.get(player_id).room_id).snapshot_id
+        
+        pkts, seq_num = build_packet(msg_type, self.next_id, self.next_seq[player_id], payload, snapshot_id)
         for p in pkts:
             for i in range(repeat):
                 self.transport.sendto(p, address)
@@ -153,7 +154,6 @@ class ESPServerProtocol:
         self.players[player_id].room_id = room_id
         self.players[player_id].player_local_id = local_id
         
-        self.player_room[player_id] = room_id
         
         players = {lid: (p.global_id, p.color) for lid, p in room.players.items()}    
         for ld, player in room.players.items():            
@@ -167,8 +167,8 @@ class ESPServerProtocol:
                 seq_keys = pkt['seq_keys']
                 
             for seq_key in seq_keys:
-                payload = build_join_ack_payload(seq_key, ld, players)
-                if self.send(MESSAGE_TYPES['JOIN_ACK'], address, payload, REDUNDANT_K) is None:
+                payload = build_join_ack_payload(seq_key, room_id, ld, players)
+                if self.send(MESSAGE_TYPES['JOIN_ACK'], address, payload, REDUNDANT_K_PACKETS) is None:
                     break
             
         print(f"Player {player_id} joined room {room_id} as local id {local_id}")
@@ -184,7 +184,7 @@ class ESPServerProtocol:
         if next_seq is None:
             return
         
-        room_id = self.player_room.get(player_id)
+        room_id = self.players.get(player_id).room_id
         if room_id is None:
             return
         
@@ -198,9 +198,8 @@ class ESPServerProtocol:
         
         self.players[player_id].room_id = 0
         self.players[player_id].player_local_id = 0
-        del self.player_room[player_id]
         
-        
+        players = {lid: (p.global_id, p.color) for lid, p in room.players.items()}   
         for ld, player in room.players.items():            
             player_info = self.players.get(player.global_id) 
             if player_info is None:
@@ -212,8 +211,8 @@ class ESPServerProtocol:
                 seq_keys = pkt['seq_keys']
     
             for seq_key in seq_keys:
-                payload = build_leave_ack_payload(seq_key)
-                if self.send(MESSAGE_TYPES['LEAVE_ACK'], address, payload, REDUNDANT_K) is None:
+                payload = build_leave_ack_payload(seq_key, players)
+                if self.send(MESSAGE_TYPES['LEAVE_ACK'], address, payload, REDUNDANT_K_PACKETS) is None:
                     break
             
         print(f"Player {player_id} left room {room_id}")
@@ -254,13 +253,15 @@ class ESPServerProtocol:
         if event_type == EVENT_TYPES['CELL_ACQUISITION']:
             self.handle_cell_acquisition(room, player_local_id, cell_idx)
         
+        room.snapshot_id += 1
+        
         for ld, player in room.players.items():
             player_info = self.players.get(player.global_id) 
             if player_info is None:
                 continue
             
             address = player_info.address
-            if self.send(MESSAGE_TYPES['EVENT'], address, pkt['payload'], REDUNDANT_K) is None:
+            if self.send(MESSAGE_TYPES['EVENT'], address, pkt['payload'], REDUNDANT_K_PACKETS) is None:
                 return
             
             print(f"Sent event to {address}")
@@ -277,7 +278,6 @@ class ESPServerProtocol:
             return
         
         seq = pkt['seq']
-        self.acked_snapshots[player_id].add(seq)
         
         # remove from buffer for this player
         key = (seq, player_id)
@@ -310,7 +310,7 @@ class ESPServerProtocol:
                 if next_seq is None:
                     continue
                 
-                pkts, _ = build_packet(MESSAGE_TYPES['SNAPSHOT'], self.next_id, start_seq=next_seq, payload=payload)
+                pkts, _ = build_packet(MESSAGE_TYPES['SNAPSHOT'], self.next_id, start_seq=next_seq, payload=payload, snapshot_id=room.snapshot_id)
                 addr = self.players[player.global_id].address
                 for p in pkts:
                     now = time.time_ns()
@@ -325,19 +325,6 @@ class ESPServerProtocol:
                 self.next_seq[player.global_id] = next_seq
         self.next_id += 1
         
-    def clear_player_acked_snapshots(self, player_id: int) -> None:
-        self.acked_snapshots.pop(player_id, None)
-        keys_to_remove = [k for k in self.snapshot_buffer.keys() if k[1] == player_id]
-        for k in keys_to_remove:
-            del self.snapshot_buffer[k]
-            
-    def cleanup_acked_snapshots_keep_last_n(self, keep_last_n: int = 100) -> None:
-        for player_id, seq_set in list(self.acked_snapshots.items()):
-            if len(seq_set) <= keep_last_n:
-                continue
-            seqs_sorted = sorted(seq_set)
-            to_keep = set(seqs_sorted[-keep_last_n:])
-            self.acked_snapshots[player_id] = to_keep
   
     def cleanup_player(self, player_id: int):
         player = self.players.get(player_id)
@@ -345,7 +332,7 @@ class ESPServerProtocol:
             return
 
         # --- 1. Remove from room ---
-        room_id = self.player_room.get(player_id)
+        room_id = self.players.get(player_id).room_id
         if room_id and room_id in self.rooms:
             room = self.rooms[room_id]
             local_id = player.player_local_id
@@ -356,10 +343,8 @@ class ESPServerProtocol:
         # --- 2. Remove mapping ---
         addr = player.address
         self.addr_to_player.pop(addr, None)
-        self.player_room.pop(player_id, None)
 
         # --- 3. Clear network-related state ---
-        self.clear_player_acked_snapshots(player_id)
         self.fragment_manager.fragments = {k: v for k, v in self.fragment_manager.fragments.items() if k[0] != player_id}
 
         # --- 4. Remove player object ---
@@ -380,8 +365,7 @@ class ESPServerProtocol:
                 if now - entry['last_sent'] > RETRANS_TIMEOUT:
                     pkt_bytes = entry['packet']
                     addr = self.players[player_id].address
-                    if seq not in self.acked_snapshots[player_id]:
-                        self.transport.sendto(pkt_bytes, addr)
+                    self.transport.sendto(pkt_bytes, addr)
                     entry['last_sent'] = now
                     entry['sent_count'] += 1
             await asyncio.sleep(0.2)
@@ -391,10 +375,6 @@ class ESPServerProtocol:
             self.fragment_manager.cleanup()
             await asyncio.sleep(1.0)
             
-    async def periodic_acked_snapshots_cleanup(self, keep_last_n: int = 100, interval: float = 60.0):
-        while True:
-            self.cleanup_acked_snapshots_keep_last_n(keep_last_n)
-            await asyncio.sleep(interval)
 
 async def run_server(host='127.0.0.1', port=9999):
     loop = asyncio.get_event_loop()
@@ -404,7 +384,6 @@ async def run_server(host='127.0.0.1', port=9999):
     loop.create_task(proto.periodic_snapshots())
     loop.create_task(proto.periodic_retransmit())
     loop.create_task(proto.cleanup_fragments_periodically())
-    loop.create_task(proto.periodic_acked_snapshots_cleanup())
     
     # server runs forever
     return transport, proto
