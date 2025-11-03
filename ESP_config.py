@@ -1,7 +1,7 @@
 import struct, time, zlib, csv, psutil, random
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Deque
 
 
 # ====== Game Config ======
@@ -13,12 +13,12 @@ TOTAL_CELLS = GRID_N * GRID_N
 """  Header Format """
 # ESP Header: protocol_id (4s -> 4-byte string), version (B -> unsigned char 1 byte), msg_type (B -> unsigned char 1 byte), snapshot_id (I -> unsigned int 4 bytes), seq_num (I -> unsigned int 4 bytes), timestamp (server, client) (Q -> unsigned long long 8 bytes), payload_len (H -> unsigned short 2 bytes), pkt_id (I -> unsigned int 4 bytes), checksum (I -> unsigned int 4 bytes)
 HEADER_FMT = "!4s B B I I Q H I I" # !-> Network (big-endian)
-HEADER_SIZE = struct.calcsize(HEADER_FMT) # should be 28 bytes
+HEADER_SIZE = struct.calcsize(HEADER_FMT) # should be 32 bytes
 
 """  Payload Formats """
 # INIT Payload: empty
 
-# INIT_ACK Payload: seq_num (I), player_id (I)
+# INIT_ACK Payload: seq_num (I), player_id (I) 
 INIT_ACK_FMT = "!I I"
 INIT_ACK_SIZE = struct.calcsize(INIT_ACK_FMT)
 
@@ -58,11 +58,11 @@ LIST_ROOMS_ACK_ENTRY_SIZE = struct.calcsize(LIST_ROOMS_ACK_ENTRY_FMT)
 EVENT_FMT = "!B B B H"
 EVENT_SIZE = struct.calcsize(EVENT_FMT)
 
-# Updates Payload: event count (B), followed by events (event_type (B), player_local_id (B), cell_idx (H))
-UPDATES_HEADER_FMT = "!B"
+# Updates Payload: updates count (H), followed by events (event_type (B), player_local_id (B), cell_idx (H))
+UPDATES_HEADER_FMT = "!H"
 UPDATES_HEADER_SIZE = struct.calcsize(UPDATES_HEADER_FMT)
-UPDATES_ACK_ENTRY_FMT = "!B B H"
-UPDATES_ACK_ENTRY_SIZE = struct.calcsize(UPDATES_ACK_ENTRY_FMT)
+UPDATES_ENTRY_FMT = "!B B H"
+UPDATES_ENTRY_SIZE = struct.calcsize(UPDATES_ENTRY_FMT)
 
 # Updates ACK Payload: seq_num (I)
 UPDATES_ACK_FMT = "!I"
@@ -101,7 +101,6 @@ MESSAGE_TYPES = {
 EVENT_TYPES = {
     'CELL_ACQUISITION': 0,
 }
-
 MAX_PACKET = 1200 # bytes
 SNAPSHOT_PAYLOAD_LIMIT = MAX_PACKET - HEADER_SIZE # bytes
 BROADCAST_FREQ_HZ = 20        # 20 snapshots/sec
@@ -110,6 +109,7 @@ RETRANS_TIMEOUT = 0.1        # seconds
 REDUNDANT_K_PACKETS = 3      # send K redundant packets
 REDUNDANT_K_UPDATES = 3      # include last K updates per packet
 LAST_K_UPDATES = 10          # max latest updates saved
+MAX_TRANSMISSION_RETRIES = 5 
 MAX_ROOM_PLAYERS = 16
 
 """ Data Structures """
@@ -121,11 +121,11 @@ class RoomPlayer:
 @dataclass
 class Room:
     room_id: int
-    snapshot_id: int = 1
     name: str
+    snapshot_id: int = 0
     players: Dict[int, RoomPlayer] = field(default_factory=dict)
-    grid: list[int] = field(default_factory=lambda: [0]*TOTAL_CELLS)  # 0 = free, else player_local_id
-    last_events: List[(int, int)] # [(local_id, cell_idx)]
+    grid: List[int] = field(default_factory=lambda: [0]*TOTAL_CELLS)  # 0 = free, else player_local_id
+    updates: Deque[Tuple[int,int,int]] = field(default_factory=lambda: deque(maxlen=LAST_K_UPDATES)) # [(event_type, local_id, cell_idx)]
 
 @dataclass
 class PlayerRoomInfo:
@@ -137,8 +137,8 @@ class PlayerRoomInfo:
 class Fragment:
     frags: Dict[int, bytes] = field(default_factory=dict)  # seq_num -> bytes
     received_bytes: int = 0
-    expected_bytes: int = 0  
-    timestamp: float = field(default_factory=time.time)
+    expected_bytes: int = 0
+    timestamp: int = field(default_factory=lambda: int(time.time_ns()))
 
 class FragmentManager:
     def __init__(self, timeout=5.0):
@@ -161,7 +161,7 @@ class FragmentManager:
 
         if frag.received_bytes >= frag.expected_bytes:
             seq_keys = sorted(frag.frags)
-            if not all(seq_keys[i] + 1 == seq_keys[i + 1] for i in  range(len(seq_keys) - 1)):
+            if not all(seq_keys[i + 1] == seq_keys[i] + 1 for i in  range(len(seq_keys) - 1)):
                 return None
             full_payload = b''.join(frag.frags[i] for i in seq_keys)
             del self.fragments[key]
@@ -283,7 +283,6 @@ def build_packet(msg_type: int, pkt_id: int, start_seq: int, payload: bytes, sna
 
     return packets, seq_num
 
-
 def parse_packet(data: bytes):
     # verify minimum size
     if len(data) < HEADER_SIZE:
@@ -306,7 +305,7 @@ def parse_packet(data: bytes):
     # all checks passed
     return {
         'msg_type': msg_type,
-        'id': pkt_id,
+        'pkt_id': pkt_id,
         'seq': seq_num,
         'timestamp': timestamp,
         'payload_len': payload_len,
@@ -372,7 +371,7 @@ def parse_join_ack_payload(payload: bytes):
     return (seq_num, room_id, player_local_id, players)
 
 def build_leave_ack_payload(seq_num: int, players: Dict[int, Dict[int, Tuple[int, Tuple[int,int,int]]]]):
-    payload = struct.pack(LEAVE_ACK_HEADER_SIZE, seq_num, len(players))
+    payload = struct.pack(LEAVE_ACK_HEADER_FMT, seq_num, len(players))
     for player_local_id, (player_id, color) in players.items():
         r, g, b = color
         payload += struct.pack(LEAVE_ACK_ENTRY_FMT, player_id, player_local_id, r, g, b)
@@ -436,6 +435,42 @@ def parse_event_payload(payload: bytes):
     if len(payload) < EVENT_SIZE:
         return None
     return struct.unpack(EVENT_FMT, payload[:EVENT_SIZE])
+
+def build_updates_payload(updates: Deque[Tuple[int, int, int]]):
+    payload = struct.pack(UPDATES_HEADER_FMT, len(updates))
+    for (event_type, local_id, cell_idx) in updates:
+        payload += struct.pack(UPDATES_ENTRY_FMT, event_type, local_id, cell_idx)
+    return payload
+
+def parse_updates_payload(payload: bytes):
+    if len(payload) < UPDATES_HEADER_SIZE:
+        return None
+
+    (updates_count,) = struct.unpack(UPDATES_HEADER_FMT, payload[:UPDATES_HEADER_SIZE])
+    updates = deque()
+    offset = UPDATES_HEADER_SIZE
+
+    for _ in range(updates_count):
+        if len(payload) < offset + UPDATES_ENTRY_SIZE:
+            return None
+
+        event_type, local_id, cell_idx = struct.unpack(
+            UPDATES_ENTRY_FMT, payload[offset : offset + UPDATES_ENTRY_SIZE]
+        )
+        offset += UPDATES_ENTRY_SIZE
+        updates.append((event_type, local_id, cell_idx))
+
+    return updates
+
+def build_updates_ack_payload(seq_num: int):
+    return struct.pack(UPDATES_ACK_FMT, seq_num)
+
+def parse_updates_ack_payload(payload: bytes):
+    # verify minimum size
+    if len(payload) < UPDATES_ACK_SIZE:
+        return None
+    (seq_num,) = struct.unpack(UPDATES_ACK_FMT, payload[:UPDATES_ACK_SIZE])
+    return seq_num
 
 def build_snapshot_payload(grid: List[int]):
     return struct.pack(SNAPSHOT_FMT, *grid)

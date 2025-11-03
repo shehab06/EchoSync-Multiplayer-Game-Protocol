@@ -6,13 +6,13 @@ from ESP_config import *
 
 # === Client ===
 class ESPClientProtocol:
-    def __init__(self, loop, server_addr, ui = None):
+    def __init__(self, loop, server_addr):
         self.loop = loop
         self.server_addr = server_addr
         self.transport = None
         self.fragment_manager = FragmentManager()
         
-        self.ui = ui
+        self.rooms = []
         self.player_id = None
         self.players = {}
         self.seq = 1
@@ -22,8 +22,8 @@ class ESPClientProtocol:
         self.grid = [0] * TOTAL_CELLS
 
         # === Reliability ===
-        self.unacked_packets = {}   # seq -> {'packet': bytes, 'time': time.time(), 'msg_type': int}
-        self.resend_count = defaultdict(int)
+        self.unacked_packets = {}   # seq -> {'packet': bytes, 'last_sent': time.time_ns(), 'msg_type': int, 'sent_count':int}
+        self.snapshot_id = 0
 
         # === Cell ownership ===
         self.pending_cells = {}     # cell_idx -> timestamp when requested
@@ -57,12 +57,12 @@ class ESPClientProtocol:
             self.handle_join_ack(payload)
         elif msg_type == MESSAGE_TYPES['LIST_ROOMS_ACK']:
             self.handle_list_rooms_ack(payload)
+        elif msg_type == MESSAGE_TYPES['EVENT']:
+            self.handle_event(pkt)
+        elif msg_type == MESSAGE_TYPES['UPDATES']:
+            self.handle_updates(pkt)
         elif msg_type == MESSAGE_TYPES['SNAPSHOT']:
             self.handle_snapshot(pkt)
-        elif msg_type == MESSAGE_TYPES['EVENT']:
-            self.handle_event(payload)
-        elif msg_type == MESSAGE_TYPES['SNAPSHOT_ACK']:
-            self.handle_snapshot_ack(payload)
         else:
             print(f"[Client] Unknown msg type {msg_type}")
 
@@ -70,27 +70,34 @@ class ESPClientProtocol:
         print("[Client] Connection closed:", exc)
 
     # === Send helpers ===
-    def send(self, msg_type, payload=b'', ack=True):
-        pkts, seq_num = build_packet(msg_type, self.pkt_id, self.seq, payload)
+    def send(self, msg_type, payload=b'', ack=True, repeat=1):
+        if ack:
+            repeat = 1
+            
+        if repeat < 1:
+            return False
+        
+        pkts, seq_num = build_packet(msg_type, self.pkt_id, self.seq, payload, self.snapshot_id)
         for p in pkts:
-            self.transport.sendto(p, self.server_addr)
+            for i in range(repeat):
+                self.transport.sendto(p, self.server_addr)
             if ack:
                 # Save for potential retransmit
                 self.unacked_packets[self.seq] = {
                     'packet': p,
-                    'time': time.time_ns(),
-                    'msg_type': msg_type
+                    'last_sent': time.time_ns(),
+                    'msg_type': msg_type,
+                    'sent_count': 0
                 }
-                self.resend_count[self.seq] = 0
         self.seq = seq_num
         self.pkt_id += 1
+        return True
         
     def ack_packet(self, seq):
         if seq not in self.unacked_packets:
             return False # duplicates
         
-        del self.unacked_packets[seq]
-        del self.resend_count[seq]
+        self.unacked_packets.pop(seq, None)
         return True
 
     # === Message Senders ===
@@ -123,15 +130,18 @@ class ESPClientProtocol:
         if cell_idx in self.pending_cells or self.grid[cell_idx] != 0:
             return  # already pending or owned
 
-        payload = build_event_payload(EVENT_TYPES['CELL_ACQUISITION'],
-                                      self.room_id, self.local_id, cell_idx)
-        self.pending_cells[cell_idx] = time.time()
+        payload = build_event_payload(EVENT_TYPES['CELL_ACQUISITION'], self.room_id, self.local_id, cell_idx)
+        self.pending_cells[cell_idx] = time.time_ns()
         print(f"[Client] Cell {cell_idx} → PENDING (ownership requested)")
         self.send(MESSAGE_TYPES['EVENT'], payload)
+        
+    def send_updates_ack(self, seq_num):
+        payload = build_updates_ack_payload(seq_num)
+        self.send(MESSAGE_TYPES['UPDATES_ACK'], payload, False)
 
     def send_snapshot_ack(self, seq_num):
         payload = build_snapshot_ack_payload(seq_num)
-        self.send(MESSAGE_TYPES['SNAPSHOT_ACK'], payload)
+        self.send(MESSAGE_TYPES['SNAPSHOT_ACK'], payload, False)
 
     def disconnect(self):
         print("[Client] Disconnecting...")
@@ -190,36 +200,19 @@ class ESPClientProtocol:
             seq, rooms = res
             if not self.ack_packet(seq):
                 return
-            print(f"[Client] Available Rooms:")
+            print(f"[Client] Available Rooms:") 
             for rid, (count, name) in rooms.items():
                 print(f" - {rid}: {name} ({count} players)")
-
+            self.rooms = rooms
             """
             if self.ui:
                 self.ui.update_room_list(rooms)
             """
-
-    def handle_snapshot(self, pkt):
-        payload = pkt['payload']
-        grid = parse_snapshot_payload(payload)
-        if grid:
-            self.grid = grid
-            self.send_snapshot_ack(pkt['seq'])
-            print(f"[Client] Snapshot #{pkt['seq']} received & ACKed")
-
-    def handle_snapshot_ack(self, payload):
-        seq = parse_snapshot_ack_payload(payload)
-        if seq in self.unacked_packets:
-            del self.unacked_packets[seq]
-            del self.resend_count[seq]
-            print(f"[Client] ACK received for seq {seq}, removed from buffer")
-
-    def handle_event(self, payload):
-        ev = parse_event_payload(payload)
-        if not ev:
+            
+    def update_cell(self, event_type, player_local_id, cell_idx):
+        if cell_idx < 0 or cell_idx >= TOTAL_CELLS:
             return
-        event_type, room_id, player_local_id, cell_idx = ev
-
+        
         if event_type == EVENT_TYPES['CELL_ACQUISITION']:
             if cell_idx in self.pending_cells:
                 del self.pending_cells[cell_idx]
@@ -229,36 +222,68 @@ class ESPClientProtocol:
             owner = "you" if player_local_id == self.local_id else f"player {player_local_id}"
             print(f"[Client] Cell {cell_idx} CONFIRMED for {owner}")
 
+    def handle_event(self, pkt):
+        payload = pkt['payload']
+        ev = parse_event_payload(payload)
+        if not ev:
+            return
+        event_type, room_id, player_local_id, cell_idx = ev
+        self.update_cell(event_type, player_local_id, cell_idx)
+        self.snapshot_id = pkt['snapshot_id']
+
+    def handle_updates(self, pkt):
+        payload = pkt['payload']
+        updates = parse_updates_payload(payload)
+        if updates:
+            required_updates_count = pkt['snapshot_id'] - self.snapshot_id
+            if required_updates_count > 0 and required_updates_count <= len(updates):
+                for update in list(updates)[-required_updates_count:]:
+                    event_type, player_local_id, cell_idx = update
+                    self.update_cell(event_type, player_local_id, cell_idx)
+                    
+                self.snapshot_id = pkt['snapshot_id']
+                for seq_key in pkt['seq_keys']: 
+                    print(f"[Client] Update #{self.snapshot_id} seq #{seq_key} received & ACKed")
+                
+            for seq_key in pkt['seq_keys']:    
+                self.send_updates_ack(seq_key)
+            
+    def handle_snapshot(self, pkt):
+        payload = pkt['payload']
+        grid = parse_snapshot_payload(payload)
+        if grid:
+            self.grid = grid
+            self.snapshot_id = pkt['snapshot_id']
+            for seq_key in pkt['seq_keys']:    
+                self.send_snapshot_ack(seq_key)
+                print(f"[Client] Snapshot #{self.snapshot_id} seq #{seq_key} received & ACKed")
+
     # === Background resend task ===
-    async def resend_unacked(self, timeout=2.0):
+    async def resend_unacked(self):
         while True:
-            now = time.time()
-            to_resend = []
+            now = time.time_ns()
             for seq, info in list(self.unacked_packets.items()):
-                if now - info['time'] > timeout:
-                    to_resend.append(seq)
-
-            for seq in to_resend:
-                self.resend_count[seq] += 1
-                if self.resend_count[seq] <= REDUNDANT_K_PACKETS:
-                    p = self.unacked_packets[seq]['packet']
-                    self.transport.sendto(p, self.server_addr)
-                    self.unacked_packets[seq]['time'] = now
-                    print(f"[Client] (K-redundant) resent packet seq={seq} ({self.resend_count[seq]}/{REDUNDANT_K_PACKETS})")
-                else:
-                    print(f"[Client] Dropping packet seq={seq} after {REDUNDANT_K_PACKETS} retries (no ACK)")
+                if info['sent_count'] > MAX_TRANSMISSION_RETRIES:
                     del self.unacked_packets[seq]
-                    del self.resend_count[seq]
-
+                    print(f"[Client] Dropping packet seq={seq} after {MAX_TRANSMISSION_RETRIES} retries (no ACK)")
+                    continue
+                
+                if now - info['last_sent'] > RETRANS_TIMEOUT:
+                    pkt_bytes = info['packet']
+                    self.transport.sendto(pkt_bytes, self.server_addr)
+                    info['last_sent'] = now
+                    info['sent_count'] += 1
+                    print(f"[Client] resent packet seq={seq} ({info['sent_count']}/{MAX_TRANSMISSION_RETRIES})")
+                    
             await asyncio.sleep(0.5)
 
     # === Background pending timeout cleanup ===
-    async def check_pending_cells(self, timeout=5.0):
+    async def check_pending_cells(self):
         """Remove or retry pending cells that never got confirmed."""
         while True:
-            now = time.time()
+            now = time.time_ns()
             for cell_idx, t0 in list(self.pending_cells.items()):
-                if now - t0 > timeout:
+                if now - t0 > RETRANS_TIMEOUT:
                     print(f"[Client] Cell {cell_idx} pending too long → retrying request")
                     del self.pending_cells[cell_idx]
                     self.request_cell(cell_idx)

@@ -16,10 +16,9 @@ class ESPServerProtocol:
         self.next_room_id = 1
         self.rooms: Dict[int, Room] = {}  # room_id -> Room
         
-        self.next_id = 1
-        self.next_seq: Dict[int, int] = {}
-        
-        self.snapshot_buffer = {}  # (seq, player_id) -> {'packet':bytes, 'last_sent':time, 'sent_count':int}
+        self.pkt_id = 1
+        self.seq: Dict[int, int] = {} 
+        self.unacked_packets = {}  # (seq, player_id) -> {'packet': bytes, 'last_sent': time.time_ns(), 'msg_type': int, 'sent_count':int}
 
     # Datagram Protocol Methods
     def connection_made(self, transport):
@@ -31,7 +30,7 @@ class ESPServerProtocol:
         if pkt is None:
             return
 
-        frag_result = self.fragment_manager.add_fragment(addr, pkt['id'], pkt['seq'], pkt['payload_len'], pkt['payload'])
+        frag_result = self.fragment_manager.add_fragment(addr, pkt['pkt_id'], pkt['seq'], pkt['payload_len'], pkt['payload'])
         if frag_result is None:
             return # waiting for more fragments
         
@@ -52,6 +51,8 @@ class ESPServerProtocol:
             self.handle_list_rooms(pkt, addr)
         elif t == MESSAGE_TYPES['EVENT']:
             self.handle_event(pkt, addr)
+        elif t == MESSAGE_TYPES['UPDATES_ACK']:
+            self.handle_updates_ack(pkt, addr)
         elif t == MESSAGE_TYPES['SNAPSHOT_ACK']:
             self.handle_snapshot_ack(pkt, addr)
         elif t == MESSAGE_TYPES['DISCONNECT']:
@@ -70,39 +71,59 @@ class ESPServerProtocol:
         pass
     
     # === Send helpers ===
-    def send(self, msg_type, address, payload=b'', repeat = 1):
+    def send(self, msg_type, address, payload=b'', ack=False, repeat=1):
+        if ack:
+            repeat = 1
+            
         if repeat < 1:
-            return None
+            return False
         
         player_id = self.addr_to_player.get(address)
         if player_id is None:
-            return
+            return False
         
-        if self.next_seq.get(player_id) is None:
-            return None
+        if self.seq.get(player_id) is None:
+            return False
         
         snapshot_id = 0
-        if (self.players.get(player_id) or self.rooms.get(self.players.get(player_id).room_id)) is not None:
+        if self.players.get(player_id) is not None and self.rooms.get(self.players.get(player_id).room_id) is not None:
             snapshot_id = self.rooms.get(self.players.get(player_id).room_id).snapshot_id
         
-        pkts, seq_num = build_packet(msg_type, self.next_id, self.next_seq[player_id], payload, snapshot_id)
+        pkts, seq_num = build_packet(msg_type, self.pkt_id, self.seq[player_id], payload, snapshot_id)
         for p in pkts:
             for i in range(repeat):
                 self.transport.sendto(p, address)
-        self.next_seq[player_id] = seq_num
+            if ack:
+                # Save for potential retransmit
+                self.unacked_packets[(self.seq[player_id], player_id)] = {
+                    'packet': p,
+                    'last_sent': time.time_ns(),
+                    'msg_type': msg_type,
+                    'sent_count': 0
+                }
+        self.seq[player_id] = seq_num
+        
+        return True
+    
+    def ack_packet(self, key):
+        if key not in self.unacked_packets:
+            return False # duplicates
+        
+        self.unacked_packets.pop(key, None)
+        return True
     
     # Handlers
     def handle_init(self, pkt, addr):
         self.players[self.next_player_id] = PlayerRoomInfo(address=addr, room_id=0, player_local_id=0)
         self.addr_to_player[addr] = self.next_player_id
-        self.next_seq[self.next_player_id] = 1
+        self.seq[self.next_player_id] = 1
         for seq_key in pkt['seq_keys']:
             payload = build_init_ack_payload(seq_key, self.next_player_id)
-            if self.send(MESSAGE_TYPES['INIT_ACK'], addr, payload) is None:
+            if not self.send(MESSAGE_TYPES['INIT_ACK'], addr, payload):
                 return
         print(f"Connected player {self.next_player_id} from {addr}")
         self.next_player_id += 1
-        self.next_id += 1
+        self.pkt_id += 1
         
     def handle_create_room(self, pkt, addr):
         room_name = parse_create_room_payload(pkt['payload'])
@@ -113,12 +134,12 @@ class ESPServerProtocol:
         self.rooms[room_id] = Room(room_id=room_id, name=room_name)
         for seq_key in pkt['seq_keys']:
             payload = build_create_ack_payload(seq_key, room_id)
-            if self.send(MESSAGE_TYPES['CREATE_ACK'], addr, payload) is None:
+            if not self.send(MESSAGE_TYPES['CREATE_ACK'], addr, payload):
                 return
                 
         print(f"Created room {room_id} named '{room_name}'")
         self.next_room_id += 1
-        self.next_id += 1
+        self.pkt_id += 1
         
     def handle_join_room(self, pkt, addr):
         room_id = parse_join_room_payload(pkt['payload'])
@@ -134,8 +155,8 @@ class ESPServerProtocol:
         if player_id is None:
             return
         
-        next_seq = self.next_seq.get(player_id)
-        if next_seq is None:
+        seq = self.seq.get(player_id)
+        if seq is None:
             return
             
         # assign local id
@@ -168,11 +189,11 @@ class ESPServerProtocol:
                 
             for seq_key in seq_keys:
                 payload = build_join_ack_payload(seq_key, room_id, ld, players)
-                if self.send(MESSAGE_TYPES['JOIN_ACK'], address, payload, REDUNDANT_K_PACKETS) is None:
+                if not self.send(MESSAGE_TYPES['JOIN_ACK'], address, payload, False, REDUNDANT_K_PACKETS):
                     break
             
         print(f"Player {player_id} joined room {room_id} as local id {local_id}")
-        self.next_id += 1
+        self.pkt_id += 1
     
     def handle_leave_room(self, pkt, addr):
         # find player_id for addr
@@ -180,8 +201,8 @@ class ESPServerProtocol:
         if player_id is None:
             return
         
-        next_seq = self.next_seq.get(player_id)
-        if next_seq is None:
+        seq = self.seq.get(player_id)
+        if seq is None:
             return
         
         room_id = self.players.get(player_id).room_id
@@ -212,11 +233,11 @@ class ESPServerProtocol:
     
             for seq_key in seq_keys:
                 payload = build_leave_ack_payload(seq_key, players)
-                if self.send(MESSAGE_TYPES['LEAVE_ACK'], address, payload, REDUNDANT_K_PACKETS) is None:
+                if not self.send(MESSAGE_TYPES['LEAVE_ACK'], address, payload, False, REDUNDANT_K_PACKETS):
                     break
             
         print(f"Player {player_id} left room {room_id}")
-        self.next_id += 1
+        self.pkt_id += 1
         
     def handle_list_rooms(self, pkt, addr):
         player_id = self.addr_to_player.get(addr)
@@ -227,11 +248,11 @@ class ESPServerProtocol:
         
         for seq_key in pkt['seq_keys']:
             payload = build_list_rooms_ack_payload(seq_key, rooms_info)
-            if self.send(MESSAGE_TYPES['LIST_ROOMS_ACK'], addr, payload) is None:
+            if not self.send(MESSAGE_TYPES['LIST_ROOMS_ACK'], addr, payload):
                 return
         
         print(f"Sent room list to {addr}")
-        self.next_id += 1
+        self.pkt_id += 1
         
     def handle_event(self, pkt, addr):
         player_id = self.addr_to_player.get(addr)
@@ -250,10 +271,7 @@ class ESPServerProtocol:
         if room.players.get(player_local_id) is None:
             return
         
-        if event_type == EVENT_TYPES['CELL_ACQUISITION']:
-            self.handle_cell_acquisition(room, player_local_id, cell_idx)
-        
-        room.snapshot_id += 1
+        self.update_cell(event_type, room, player_local_id, cell_idx)
         
         for ld, player in room.players.items():
             player_info = self.players.get(player.global_id) 
@@ -261,15 +279,64 @@ class ESPServerProtocol:
                 continue
             
             address = player_info.address
-            if self.send(MESSAGE_TYPES['EVENT'], address, pkt['payload'], REDUNDANT_K_PACKETS) is None:
+            if not self.send(MESSAGE_TYPES['EVENT'], address, pkt['payload'], False, REDUNDANT_K_PACKETS):
                 return
             
             print(f"Sent event to {address}")
-        self.next_id += 1
+        self.pkt_id += 1
         
-    def handle_cell_acquisition(self, room, player_local_id, cell_idx):
-        if 0 <= cell_idx < TOTAL_CELLS and room.grid[cell_idx] == 0:
+    def update_cell(self, event_type, room, player_local_id, cell_idx):
+        
+        if not (0 <= cell_idx < TOTAL_CELLS):
+            return
+        
+        if event_type == EVENT_TYPES['CELL_ACQUISITION']:
+            if room.grid[cell_idx] != 0:
+                return
             room.grid[cell_idx] = player_local_id
+            
+        room.snapshot_id += 1
+        room.updates.append((event_type, player_local_id, cell_idx))
+
+    def handle_updates_ack(self, pkt, addr):
+        # find player_id for addr
+        player_id = self.addr_to_player.get(addr)
+        if player_id is None:
+            return
+        
+        if self.players.get(player_id) is None or self.rooms.get(self.players.get(player_id).room_id) is None:
+            return
+        
+        seq = parse_updates_ack_payload(pkt["payload"])
+        if not seq:
+            return
+        
+        key = (seq, player_id)
+        
+        if key in self.unacked_packets:
+            pkt = parse_packet(self.unacked_packets[key]['packet'])
+            if pkt is None:
+                return
+            recv_time = time.time_ns()
+            self.metrics_logger.log_snapshot(
+                client_id=player_id,
+                snapshot_id=pkt['snapshot_id'],
+                seq_num=seq,
+                server_time=pkt['timestamp'],
+                recv_time=recv_time
+            )
+        
+        if not self.ack_packet(key): # remove from buffer for this player
+            return 
+        
+        room = self.rooms.get(self.players.get(player_id).room_id)
+        required_updates_count = room.snapshot_id - pkt['snapshot_id']
+        if required_updates_count > LAST_K_UPDATES:
+            payload = build_snapshot_payload(room.grid)
+            self.send(MESSAGE_TYPES['SNAPSHOT'], addr, payload=payload, ack = True)
+        elif required_updates_count > 0:
+            payload = build_updates_payload(list(room.updates)[-required_updates_count])
+            self.send(MESSAGE_TYPES['UPDATES'], addr, payload=payload, ack = True)
 
     def handle_snapshot_ack(self, pkt, addr):
         # find player_id for addr
@@ -277,21 +344,37 @@ class ESPServerProtocol:
         if player_id is None:
             return
         
-        seq = pkt['seq']
+        if self.players.get(player_id) is None or self.rooms.get(self.players.get(player_id).room_id) is None:
+            return
         
-        # remove from buffer for this player
+        seq = parse_snapshot_ack_payload(pkt["payload"])
+        if not seq:
+            return
+        
+        seq = pkt['seq']
         key = (seq, player_id)
-        if key in self.snapshot_buffer:
-            pkt = parse_packet(self.snapshot_buffer[key]['packet'])
+        
+        if key in self.unacked_packets:
+            pkt = parse_packet(self.unacked_packets[key]['packet'])
+            if pkt is None:
+                return
             recv_time = time.time_ns()
             self.metrics_logger.log_snapshot(
                 client_id=player_id,
-                snapshot_id=pkt['id'],
+                snapshot_id=pkt['snapshot_id'],
                 seq_num=seq,
                 server_time=pkt['timestamp'],
                 recv_time=recv_time
             )
-            del self.snapshot_buffer[key]
+             
+        if not self.ack_packet(key): # remove from buffer for this player
+            return 
+        
+        room = self.rooms.get(self.players.get(player_id).room_id)
+        snapshot_id = room.snapshot_id
+        if pkt['snapshot_id'] < snapshot_id:
+            payload = build_snapshot_payload(room.grid)
+            self.send(MESSAGE_TYPES['SNAPSHOT'], addr, payload=payload, ack = True)
 
     def handle_disconnect(self, pkt, addr):
         player_id = self.addr_to_player.get(addr)
@@ -300,32 +383,20 @@ class ESPServerProtocol:
             print(f"Player {player_id} disconnected gracefully")
 
     # Helper Methods
-    def send_snapshot_to_all(self):
+    def send_updates_to_all(self):
         for room in self.rooms.values():
-            payload = build_snapshot_payload(room.grid)
+            payload = build_updates_payload(list(room.updates)[-REDUNDANT_K_UPDATES:])
             
             for player in room.players.values():
-                
-                next_seq = self.next_seq.get(player.global_id)
-                if next_seq is None:
+                seq = self.seq.get(player.global_id)
+                if seq is None:
                     continue
                 
-                pkts, _ = build_packet(MESSAGE_TYPES['SNAPSHOT'], self.next_id, start_seq=next_seq, payload=payload, snapshot_id=room.snapshot_id)
-                addr = self.players[player.global_id].address
-                for p in pkts:
-                    now = time.time_ns()
-                    self.snapshot_buffer[(next_seq, player.global_id)] = {
-                        'packet': p,
-                        'last_sent': now,
-                        'sent_count': 1
-                    }
-                    self.transport.sendto(p, addr)
-                    print(f"Snapshot Sent Player ID:{player.global_id}, Seq_num:{next_seq}")
-                    next_seq+=1
-                self.next_seq[player.global_id] = next_seq
-        self.next_id += 1
+                if not self.send(MESSAGE_TYPES['UPDATES'], self.players[player.global_id].address, payload=payload, ack = True):
+                    continue                
+                print(f"Update Sent Player ID:{player.global_id}, Seq_num:{self.seq[player.global_id]}")
+        self.pkt_id += 1
         
-  
     def cleanup_player(self, player_id: int):
         player = self.players.get(player_id)
         if not player:
@@ -353,21 +424,25 @@ class ESPServerProtocol:
         print(f"✅ Cleaned up player {player_id}")
 
     # Async Methods
-    async def periodic_snapshots(self):
+    async def periodic_updates(self):
         while True:
-            self.send_snapshot_to_all()
+            self.send_updates_to_all()
             await asyncio.sleep(SNAPSHOT_INTERVAL)
 
     async def periodic_retransmit(self):
         while True:
             now = time.time_ns()
-            for (seq, player_id), entry in list(self.snapshot_buffer.items()):
+            for (seq, player_id), entry in list(self.unacked_packets.items()):
+                if entry['sent_count'] > MAX_TRANSMISSION_RETRIES:
+                    del self.unacked_packets[(seq, player_id)]
+                    continue
                 if now - entry['last_sent'] > RETRANS_TIMEOUT:
                     pkt_bytes = entry['packet']
                     addr = self.players[player_id].address
                     self.transport.sendto(pkt_bytes, addr)
                     entry['last_sent'] = now
                     entry['sent_count'] += 1
+                    
             await asyncio.sleep(0.2)
     
     async def cleanup_fragments_periodically(self):
@@ -381,7 +456,7 @@ async def run_server(host='127.0.0.1', port=9999):
     print("Starting server...")
     transport, proto = await loop.create_datagram_endpoint(lambda: ESPServerProtocol(loop), local_addr=(host, port))
     # spawn snapshot broadcaster and retransmit loop
-    loop.create_task(proto.periodic_snapshots())
+    loop.create_task(proto.periodic_updates())
     loop.create_task(proto.periodic_retransmit())
     loop.create_task(proto.cleanup_fragments_periodically())
     
