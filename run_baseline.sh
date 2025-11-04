@@ -48,4 +48,6 @@ for pid in "${CLIENT_PIDS[@]}"; do
   kill $pid 2>/dev/null || true
 done
 
+python3 analyze_metrics.py
+sleep 2
 echo "[TEST] Done. Logs in $LOGDIR, results in $RESULTS_DIR"

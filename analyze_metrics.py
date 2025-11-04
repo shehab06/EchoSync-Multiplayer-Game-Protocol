@@ -24,14 +24,20 @@ df = df.dropna(subset=["latency_ms", "jitter_ms"])
 after = len(df)
 print(f"[clean] Removed {before-after} corrupted rows, remaining: {after}")
 
-# -------- 20 updates/sec validation --------
+# -------- 20 updates/sec validation (per client) --------
 df["server_timestamp_ms"] = pd.to_numeric(df["server_timestamp_ms"], errors="coerce")
 df["timestamp_sec"] = (df["server_timestamp_ms"] // 1000).astype(int)
-updates_per_sec = df.groupby("timestamp_sec").size()
 
-avg_updates = updates_per_sec.mean()
-min_updates = updates_per_sec.min()
-max_updates = updates_per_sec.max()
+# Group by client and time second
+updates_per_client_sec = df.groupby(["client_id", "timestamp_sec"]).size().reset_index(name="count")
+
+# Now compute average/min/max across all clients
+avg_updates_per_client = updates_per_client_sec["count"].mean()
+min_updates_per_client = updates_per_client_sec["count"].min()
+max_updates_per_client = updates_per_client_sec["count"].max()
+
+print(f"[updates] Avg per client: {avg_updates_per_client:.2f}, min: {min_updates_per_client}, max: {max_updates_per_client}")
+
 
 # -------- Stats --------
 def pct95(x): return np.percentile(x.dropna(), 95)
@@ -49,9 +55,9 @@ stats = {
     "Max CPU% (clients)": df["cpu_percent"].max(),
     "Avg Bandwidth (kbps)": df["bandwidth_per_client_kbps"].mean(),
     "Total Packets Received": len(df),
-    "Avg Updates/sec": avg_updates,
-    "Min Updates/sec": min_updates,
-    "Max Updates/sec": max_updates
+    "Avg Updates/sec": avg_updates_per_client,
+    "Min Updates/sec": min_updates_per_client,
+    "Max Updates/sec": max_updates_per_client
 }
 
 print("=== Baseline Metrics Summary ===")
@@ -74,16 +80,6 @@ plt.title("Latency CDF (Baseline)")
 plt.grid(True)
 plt.savefig(os.path.join(plots_dir, "latency_cdf.png"))
 
-# Snapshot frequency
-plt.figure(figsize=(6,4))
-plt.plot(updates_per_sec.index, updates_per_sec.values)
-plt.axhline(20, linestyle="--", label="Target = 20 updates/sec")
-plt.xlabel("Second")
-plt.ylabel("Snapshots/sec")
-plt.title("Snapshot Update Rate")
-plt.grid(True)
-plt.legend()
-plt.savefig(os.path.join(plots_dir, "snapshots_per_sec.png"))
 
 # Latency over time
 plt.figure(figsize=(6,4))
@@ -129,6 +125,18 @@ plt.xlabel("Latency (ms)")
 plt.ylabel("Count")
 plt.grid(True)
 plt.savefig(os.path.join(plots_dir, "latency_histogram.png"))
+
+# Per-Client Update Rate
+plt.figure(figsize=(6,4))
+for client_id, group in updates_per_client_sec.groupby("client_id"):
+    plt.plot(group["timestamp_sec"], group["count"], label=f"Client {client_id}")
+plt.axhline(20, linestyle="--", color="gray", label="Target = 20 updates/sec")
+plt.xlabel("Second")
+plt.ylabel("Updates/sec")
+plt.title("Per-Client Snapshot Rate")
+plt.legend()
+plt.grid(True)
+plt.savefig(os.path.join(plots_dir, "per_client_snapshots.png"))
 
 print("[analysis] All plots saved in ./plots/")
 print("✅ Analysis complete.")
