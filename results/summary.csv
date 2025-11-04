@@ -1,0 +1,2 @@
+Mean Latency (ms),Median Latency (ms),95th Latency (ms),Mean Jitter (ms),Median Jitter (ms),95th Jitter (ms),Mean Error,95th Error,Avg CPU% (clients),Avg Bandwidth (kbps),Total Packets Received
+1.785552316164561,2.0,4.0,1.485584710074506,1.0,4.0,0.0497874983017949,0.09497546636362394,3.152348558471007,109.65842929983607,3087

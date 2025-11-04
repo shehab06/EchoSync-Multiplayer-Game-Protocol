@@ -1,4 +1,4 @@
-import struct, time, zlib, csv, psutil, random
+import struct, time, zlib, csv, psutil, random, os
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Dict, Tuple, List, Deque
@@ -104,14 +104,13 @@ EVENT_TYPES = {
 MAX_PACKET = 1200 # bytes
 SNAPSHOT_PAYLOAD_LIMIT = MAX_PACKET - HEADER_SIZE # bytes
 BROADCAST_FREQ_HZ = 20        # 20 snapshots/sec
-SNAPSHOT_INTERVAL = 1.0 / BROADCAST_FREQ_HZ
+UPDATES_INTERVAL = 1.0 / BROADCAST_FREQ_HZ
 RETRANS_TIMEOUT = 0.1        # seconds
 REDUNDANT_K_PACKETS = 3      # send K redundant packets
 REDUNDANT_K_UPDATES = 3      # include last K updates per packet
 LAST_K_UPDATES = 10          # max latest updates saved
 MAX_TRANSMISSION_RETRIES = 5 
-MAX_ROOM_PLAYERS = 16
-
+REQUIRED_ROOM_PLAYERS = 4
 """ Data Structures """
 @dataclass
 class RoomPlayer:
@@ -188,7 +187,8 @@ class MetricsLogger:
             "bandwidth_per_client_kbps"
         ]
         # Initialize CSV
-        self.file = open(filename, "w", newline="")
+        os.makedirs("results", exist_ok=True)
+        self.file = open(os.path.join("results", filename), "w", newline="")
         self.writer = csv.DictWriter(self.file, fieldnames=self.fieldnames)
         self.writer.writeheader()
 

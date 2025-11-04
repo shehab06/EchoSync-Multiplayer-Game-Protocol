@@ -1,45 +1,50 @@
 #!/bin/bash
-# run_baseline.sh - Phase 1 baseline test
+# run_baseline.sh - Run server + 4 clients (1 test=0, 3 test=1)
 set -e
+
 LOGDIR="./logs"
-mkdir -p "$LOGDIR"
+RESULTS_DIR="./results"
+mkdir -p "$LOGDIR" "$RESULTS_DIR"
 
 NUM_CLIENTS=4
 DURATION=60  # seconds
+CLIENTDURATION=40  # seconds
 
-echo "[TEST] Baseline test: results -> $RESULTS_DIR, duration ${DURATION}s, clients ${NUM_CLIENTS}"
+echo "[TEST] Running baseline: duration=${DURATION}s, clients=${NUM_CLIENTS}"
 
-# Start server (broadcasting to local client ports)
-CLIENT_ADDRS=""
-for ((i=1;i<=NUM_CLIENTS;i++)); do
-  CLIENT_ADDRS="$CLIENT_ADDRS 127.0.0.1:$((5000+i))"
-done
+# Install dependencies if needed
+python3 -m pip install -r requirements.txt
 
 # Start server
-python3 -m pip install -r requirements.txt
-python3 server.py --clients $CLIENT_ADDRS --rate 20 --duration $DURATION 2>&1 &
+python3 server.py --duration $DURATION 2>&1 &
 SERVER_PID=$!
-echo "[TEST] server pid=$SERVER_PID"
+echo "[TEST] Server started (PID=$SERVER_PID)"
+sleep 2
 
-sleep 1
-
-# Start clients
+# === Start Clients ===
 CLIENT_PIDS=()
-for ((i=1;i<=NUM_CLIENTS;i++)); do
-  OUT="$RESULTS_DIR/client${i}.csv"
-  python3 client.py --player $i --headless --duration $DURATION --out "$OUT" > "$LOGDIR/client${i}_stdout.log" 2>&1 &
+
+# 1️⃣ Client 1 → test 0
+python3 client.py --test "0" --duration $CLIENTDURATION > "$LOGDIR/client1_stdout.log" 2>&1 &
+CLIENT_PIDS+=($!)
+echo "[TEST] Started client1 (test=0, PID=${CLIENT_PIDS[-1]})"
+
+# 2️⃣–4️⃣ Clients 2-4 → test 1
+for ((i=2; i<=NUM_CLIENTS; i++)); do
+  python3 client.py --test "1" --duration $CLIENTDURATION > "$LOGDIR/client${i}_stdout.log" 2>&1 &
   CLIENT_PIDS+=($!)
-  echo "[TEST] started client $i pid=${CLIENT_PIDS[-1]}"
-  sleep 0.3
+  echo "[TEST] Started client${i} (test=1, PID=${CLIENT_PIDS[-1]})"
+  sleep 0.5
 done
 
-# Wait for duration + small buffer
-sleep $((DURATION + 2))
+# Wait for test duration
+sleep $((CLIENTDURATION + 5))
 
-# Ensure processes are stopped
+# Kill all processes
+echo "[TEST] Stopping all..."
 kill $SERVER_PID 2>/dev/null || true
 for pid in "${CLIENT_PIDS[@]}"; do
   kill $pid 2>/dev/null || true
 done
 
-echo "[TEST] Baseline finished. Files in $RESULTS_DIR."
+echo "[TEST] Done. Logs in $LOGDIR, results in $RESULTS_DIR"

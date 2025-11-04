@@ -161,7 +161,7 @@ class ESPServerProtocol:
             
         # assign local id
         used_ids = set(room.players.keys())
-        for local_id in range(1, MAX_ROOM_PLAYERS + 1):
+        for local_id in range(1, REQUIRED_ROOM_PLAYERS + 1):
             if local_id not in used_ids:
                 break
         else:
@@ -176,7 +176,8 @@ class ESPServerProtocol:
         self.players[player_id].player_local_id = local_id
         
         
-        players = {lid: (p.global_id, p.color) for lid, p in room.players.items()}    
+        players = {lid: (p.global_id, p.color) for lid, p in room.players.items()}
+        sent = False
         for ld, player in room.players.items():            
             player_info = self.players.get(player.global_id) 
             if player_info is None:
@@ -191,9 +192,11 @@ class ESPServerProtocol:
                 payload = build_join_ack_payload(seq_key, room_id, ld, players)
                 if not self.send(MESSAGE_TYPES['JOIN_ACK'], address, payload, False, REDUNDANT_K_PACKETS):
                     break
-            
-        print(f"Player {player_id} joined room {room_id} as local id {local_id}")
-        self.pkt_id += 1
+                sent = True
+                
+        if sent:
+            print(f"Player {player_id} joined room {room_id} as local id {local_id}")
+            self.pkt_id += 1
     
     def handle_leave_room(self, pkt, addr):
         # find player_id for addr
@@ -220,7 +223,8 @@ class ESPServerProtocol:
         self.players[player_id].room_id = 0
         self.players[player_id].player_local_id = 0
         
-        players = {lid: (p.global_id, p.color) for lid, p in room.players.items()}   
+        players = {lid: (p.global_id, p.color) for lid, p in room.players.items()}
+        sent = False   
         for ld, player in room.players.items():            
             player_info = self.players.get(player.global_id) 
             if player_info is None:
@@ -235,9 +239,11 @@ class ESPServerProtocol:
                 payload = build_leave_ack_payload(seq_key, players)
                 if not self.send(MESSAGE_TYPES['LEAVE_ACK'], address, payload, False, REDUNDANT_K_PACKETS):
                     break
-            
-        print(f"Player {player_id} left room {room_id}")
-        self.pkt_id += 1
+                sent = True
+        
+        if sent:
+            print(f"Player {player_id} left room {room_id}")
+            self.pkt_id += 1
         
     def handle_list_rooms(self, pkt, addr):
         player_id = self.addr_to_player.get(addr)
@@ -271,19 +277,32 @@ class ESPServerProtocol:
         if room.players.get(player_local_id) is None:
             return
         
-        self.update_cell(event_type, room, player_local_id, cell_idx)
-        
-        for ld, player in room.players.items():
-            player_info = self.players.get(player.global_id) 
+        sent = False
+        if len(room.players) < REQUIRED_ROOM_PLAYERS:
+            player_info = self.players.get(player_id) 
             if player_info is None:
-                continue
+                return
             
             address = player_info.address
-            if not self.send(MESSAGE_TYPES['EVENT'], address, pkt['payload'], False, REDUNDANT_K_PACKETS):
+            payload = build_event_payload(event_type, room_id, 0, cell_idx)
+            if not self.send(MESSAGE_TYPES['EVENT'], address, payload, False, REDUNDANT_K_PACKETS):
                 return
             
             print(f"Sent event to {address}")
-        self.pkt_id += 1
+        else:
+            self.update_cell(event_type, room, player_local_id, cell_idx)
+            for ld, player in room.players.items():
+                player_info = self.players.get(player.global_id) 
+                if player_info is None:
+                    continue
+                
+                address = player_info.address
+                if not self.send(MESSAGE_TYPES['EVENT'], address, pkt['payload'], False, REDUNDANT_K_PACKETS):
+                    continue
+                sent = True
+                print(f"Sent event to {address}")
+        if sent:
+            self.pkt_id += 1
         
     def update_cell(self, event_type, room, player_local_id, cell_idx):
         
@@ -335,7 +354,7 @@ class ESPServerProtocol:
             payload = build_snapshot_payload(room.grid)
             self.send(MESSAGE_TYPES['SNAPSHOT'], addr, payload=payload, ack = True)
         elif required_updates_count > 0:
-            payload = build_updates_payload(list(room.updates)[-required_updates_count])
+            payload = build_updates_payload(list(room.updates)[-required_updates_count:])
             self.send(MESSAGE_TYPES['UPDATES'], addr, payload=payload, ack = True)
 
     def handle_snapshot_ack(self, pkt, addr):
@@ -384,9 +403,11 @@ class ESPServerProtocol:
 
     # Helper Methods
     def send_updates_to_all(self):
+        sent = False
         for room in self.rooms.values():
             payload = build_updates_payload(list(room.updates)[-REDUNDANT_K_UPDATES:])
-            
+            if len(room.players) < REQUIRED_ROOM_PLAYERS:
+                continue
             for player in room.players.values():
                 seq = self.seq.get(player.global_id)
                 if seq is None:
@@ -395,7 +416,9 @@ class ESPServerProtocol:
                 if not self.send(MESSAGE_TYPES['UPDATES'], self.players[player.global_id].address, payload=payload, ack = True):
                     continue                
                 print(f"Update Sent Player ID:{player.global_id}, Seq_num:{self.seq[player.global_id]}")
-        self.pkt_id += 1
+                sent = True
+        if sent:
+            self.pkt_id += 1
         
     def cleanup_player(self, player_id: int):
         player = self.players.get(player_id)
@@ -427,16 +450,16 @@ class ESPServerProtocol:
     async def periodic_updates(self):
         while True:
             self.send_updates_to_all()
-            await asyncio.sleep(SNAPSHOT_INTERVAL)
+            await asyncio.sleep(UPDATES_INTERVAL)
 
     async def periodic_retransmit(self):
         while True:
             now = time.time_ns()
             for (seq, player_id), entry in list(self.unacked_packets.items()):
-                if entry['sent_count'] > MAX_TRANSMISSION_RETRIES:
+                if entry['sent_count'] >= MAX_TRANSMISSION_RETRIES:
                     del self.unacked_packets[(seq, player_id)]
                     continue
-                if now - entry['last_sent'] > RETRANS_TIMEOUT:
+                if now - entry['last_sent'] > int(RETRANS_TIMEOUT * 1e9):
                     pkt_bytes = entry['packet']
                     addr = self.players[player_id].address
                     self.transport.sendto(pkt_bytes, addr)

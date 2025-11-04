@@ -12,7 +12,7 @@ class ESPClientProtocol:
         self.transport = None
         self.fragment_manager = FragmentManager()
         
-        self.rooms = []
+        self.rooms = {}
         self.player_id = None
         self.players = {}
         self.seq = 1
@@ -40,7 +40,7 @@ class ESPClientProtocol:
         if pkt is None:
             return
 
-        frag_result = self.fragment_manager.add_fragment(addr, pkt['id'], pkt['seq'], pkt['payload_len'], pkt['payload'])
+        frag_result = self.fragment_manager.add_fragment(addr, pkt['pkt_id'], pkt['seq'], pkt['payload_len'], pkt['payload'])
         if frag_result is None:
             return # waiting for more fragments
         
@@ -106,11 +106,16 @@ class ESPClientProtocol:
         self.send(MESSAGE_TYPES['INIT'])
 
     def send_create_room(self, name):
+        if not isinstance(name, str):
+            return
         payload = build_create_room_payload(name)
         print(f"[Client] Creating room: {name}")
         self.send(MESSAGE_TYPES['CREATE_ROOM'], payload)
 
     def send_join_room(self, room_id):
+        if room_id < 1:
+            return
+        
         payload = build_join_room_payload(room_id)
         print(f"[Client] Joining room {room_id}")
         self.send(MESSAGE_TYPES['JOIN_ROOM'], payload)
@@ -133,13 +138,17 @@ class ESPClientProtocol:
         payload = build_event_payload(EVENT_TYPES['CELL_ACQUISITION'], self.room_id, self.local_id, cell_idx)
         self.pending_cells[cell_idx] = time.time_ns()
         print(f"[Client] Cell {cell_idx} → PENDING (ownership requested)")
-        self.send(MESSAGE_TYPES['EVENT'], payload)
+        self.send(MESSAGE_TYPES['EVENT'], payload, False)
         
     def send_updates_ack(self, seq_num):
+        if seq_num < 1:
+            return
         payload = build_updates_ack_payload(seq_num)
         self.send(MESSAGE_TYPES['UPDATES_ACK'], payload, False)
 
     def send_snapshot_ack(self, seq_num):
+        if seq_num < 1:
+            return
         payload = build_snapshot_ack_payload(seq_num)
         self.send(MESSAGE_TYPES['SNAPSHOT_ACK'], payload, False)
 
@@ -158,7 +167,6 @@ class ESPClientProtocol:
                 return
             self.player_id = player_id
             print(f"[Client] Got player_id = {self.player_id}")
-            self.send_create_room(f"Room_{random.randint(100,999)}")
 
     def handle_create_ack(self, payload):
         res = parse_create_ack_payload(payload)
@@ -216,8 +224,13 @@ class ESPClientProtocol:
         if event_type == EVENT_TYPES['CELL_ACQUISITION']:
             if cell_idx in self.pending_cells:
                 del self.pending_cells[cell_idx]
+            
+            if player_local_id == 0:
+                return
+                
             if player_local_id == self.local_id:
                 self.owned_cells.add(cell_idx)
+            
             self.grid[cell_idx] = player_local_id
             owner = "you" if player_local_id == self.local_id else f"player {player_local_id}"
             print(f"[Client] Cell {cell_idx} CONFIRMED for {owner}")
@@ -263,12 +276,12 @@ class ESPClientProtocol:
         while True:
             now = time.time_ns()
             for seq, info in list(self.unacked_packets.items()):
-                if info['sent_count'] > MAX_TRANSMISSION_RETRIES:
+                if info['sent_count'] >= MAX_TRANSMISSION_RETRIES:
                     del self.unacked_packets[seq]
                     print(f"[Client] Dropping packet seq={seq} after {MAX_TRANSMISSION_RETRIES} retries (no ACK)")
                     continue
                 
-                if now - info['last_sent'] > RETRANS_TIMEOUT:
+                if now - info['last_sent'] > int(RETRANS_TIMEOUT * 1e9):
                     pkt_bytes = info['packet']
                     self.transport.sendto(pkt_bytes, self.server_addr)
                     info['last_sent'] = now
@@ -283,15 +296,47 @@ class ESPClientProtocol:
         while True:
             now = time.time_ns()
             for cell_idx, t0 in list(self.pending_cells.items()):
-                if now - t0 > RETRANS_TIMEOUT:
+                if now - t0 > int(RETRANS_TIMEOUT * 1e9):
                     print(f"[Client] Cell {cell_idx} pending too long → retrying request")
                     del self.pending_cells[cell_idx]
                     self.request_cell(cell_idx)
             await asyncio.sleep(1)
 
 
+def test_create(protocol):
+    protocol.send_create_room(f"Room_{random.randint(100,999)}")
+    
+async def test_list(protocol):
+    protocol.send_list_rooms()
+    while not protocol.rooms:
+        await asyncio.sleep(0.5)
+    
+    room = 0
+    for room_id, (num_of_players, room_name) in protocol.rooms.items():
+        print(f"[Client] Room ID:{room_id}, Room Name:{room_name}, Num of Players: {num_of_players}")
+        room = room_id
+    protocol.send_join_room(room)
+    
+async def run_test(protocol, test, duration=None):
+    start_time = time.time()
+
+    if test == 0:
+        test_create(protocol)
+    elif test == 1:
+        await test_list(protocol)
+        
+    while True:
+        if duration and (time.time() - start_time) >= float(duration):
+            print(f"[Client] Test duration {duration}s ended.")
+            break
+        
+        await asyncio.sleep(3)
+        if protocol.room_id and protocol.local_id:
+            cell = random.randint(0, TOTAL_CELLS - 1)
+            protocol.request_cell(cell)
+        
 # === Runner ===
-async def run_client(host="127.0.0.1", port=9999):
+async def run_client(test, duration=None, host="127.0.0.1", port=9999):
     loop = asyncio.get_event_loop()
     transport, protocol = await loop.create_datagram_endpoint(
         lambda: ESPClientProtocol(loop, (host, port)),
@@ -303,15 +348,19 @@ async def run_client(host="127.0.0.1", port=9999):
     loop.create_task(protocol.check_pending_cells())
 
     try:
-        while True:
-            await asyncio.sleep(3)
-            if protocol.room_id and protocol.local_id:
-                cell = random.randint(0, TOTAL_CELLS - 1)
-                protocol.request_cell(cell)
+        if test is not None:
+            await run_test(protocol, test, duration)
+        else:
+            while True:
+                await asyncio.sleep(3)
     except KeyboardInterrupt:
         protocol.disconnect()
         transport.close()
 
-
 if __name__ == "__main__":
-    asyncio.run(run_client())
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test", type=int, help="Choose test sequence", required=False)
+    parser.add_argument("--duration", type=int, help="Choose test sequence", required=False)
+    args = parser.parse_args()
+    asyncio.run(run_client(test=args.test, duration=args.duration))

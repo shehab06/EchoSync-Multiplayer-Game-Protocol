@@ -4,13 +4,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 
-BASE="./results/baseline"
-merged_path = os.path.join(BASE, "merged.csv")
+BASE="./results"
+metrics_path = os.path.join(BASE, "metrics.csv")
 summary_path = "./results/summary.csv"
 plots_dir = "./plots"
 os.makedirs(plots_dir, exist_ok=True)
 
-df = pd.read_csv(merged_path)
+df = pd.read_csv(metrics_path)
 
 def pct95(x): return np.percentile(x.dropna(), 95)
 
