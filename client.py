@@ -48,8 +48,8 @@ class ESPClientProtocol:
                     log("[Client] Test duration ended, client stopped")
                     self.disconnect()
                     
-                # wait for readability up to 0.001ms
-                rlist, _, _ = select.select([self.sock], [], [], 0.001)
+                # wait for readability up to 0.01ms
+                rlist, _, _ = select.select([self.sock], [], [], 0.01)
 
                 if rlist:
                     self.handle_recv()
