@@ -1,13 +1,21 @@
 from ESP_config import *
-import asyncio, logging, argparse
+import logging, argparse, socket, select, sys
+
 
 # ====== Server Implementation ======
 class ESPServerProtocol:
-    def __init__(self, loop):
-        self.loop = loop
-        self.transport = None
+    def __init__(self, host="0.0.0.0", port=9999):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind((host, port))
+        self.sock.setblocking(False)
         self.fragment_manager = FragmentManager()
         self.metrics_logger = MetricsLogger()
+        
+        self.tasks = {
+            "broadcast_updates": {"interval": UPDATES_INTERVAL, "last": 0.0, "func": self.send_updates_to_all},
+            "retransmit": {"interval": 0.2, "last": 0.0, "func": self.retransmit},
+            "fragment_cleanup": {"interval": 1.0, "last": 0.0, "func": self.fragment_manager.cleanup},
+        }        
         
         self.next_player_id = 1
         self.players: Dict[int, PlayerRoomInfo] = {}  # player_id -> PlayerRoomInfo
@@ -21,55 +29,87 @@ class ESPServerProtocol:
         self.unacked_packets = {}  # (seq, player_id) -> {'packet': bytes, 'last_sent': time.time_ns(), 'msg_type': int, 'sent_count':int}
 
     # Datagram Protocol Methods
-    def connection_made(self, transport):
-        self.transport = transport
-        print("Server listening")
+    def run(self, duration=None):
+        try:
+            log("[SERVER] Running (Ctrl+C to stop)")
+            start = time.time()
+            while True:
+                if duration and (time.time() - start) >= duration:
+                    log("[SERVER] Test duration ended, server stopped")
+                    try:
+                        self.sock.close()
+                    except Exception:
+                        pass
+                    sys.exit(0)
+                    
+                # wait for readability up to 0.001ms
+                rlist, _, _ = select.select([self.sock], [], [], 0.001)
 
-    def datagram_received(self, data, addr):
-        pkt = parse_packet(data)
-        if pkt is None:
-            return
-
-        frag_result = self.fragment_manager.add_fragment(addr, pkt['pkt_id'], pkt['seq'], pkt['payload_len'], pkt['payload'])
-        if frag_result is None:
-            return # waiting for more fragments
+                if rlist:
+                    self.handle_recv()
+                
+                now = time.time()
+                for name, t in self.tasks.items():
+                    if now - t["last"] >= t["interval"]:
+                        try:
+                            t["func"]()
+                        except Exception as e:
+                            log(f"[SERVER] {name} error:", e)
+                        t["last"] = now
+                
+        except KeyboardInterrupt:
+            log("[SERVER] Stopping by user (Ctrl+C).")
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            sys.exit(0)
         
-        (seq_keys, payload) = frag_result
-        pkt['payload'] = payload
-        pkt['seq_keys'] = seq_keys
-        
-        t = pkt['msg_type']
-        if t == MESSAGE_TYPES['INIT']:
-            self.handle_init(pkt, addr)
-        elif t == MESSAGE_TYPES['CREATE_ROOM']:
-            self.handle_create_room(pkt, addr)
-        elif t == MESSAGE_TYPES['JOIN_ROOM']:
-            self.handle_join_room(pkt, addr)
-        elif t == MESSAGE_TYPES['LEAVE_ROOM']:
-            self.handle_leave_room(pkt, addr)
-        elif t == MESSAGE_TYPES['LIST_ROOMS']:
-            self.handle_list_rooms(pkt, addr)
-        elif t == MESSAGE_TYPES['EVENT']:
-            self.handle_event(pkt, addr)
-        elif t == MESSAGE_TYPES['UPDATES_ACK']:
-            self.handle_updates_ack(pkt, addr)
-        elif t == MESSAGE_TYPES['SNAPSHOT_ACK']:
-            self.handle_snapshot_ack(pkt, addr)
-        elif t == MESSAGE_TYPES['DISCONNECT']:
-            self.handle_disconnect(pkt, addr)
-        else:
-            # ignore clients won't send INIT_ACK, CREATE_ACK, JOIN_ACK, LIST_ROOMS_ACK, SNAPSHOT or unknown message type
-            pass
-    
-    def connection_lost(self, exc):
-        print("Connection lost:", exc)
+    def handle_recv(self):
+        while True:
+            try:
+                data, addr = self.sock.recvfrom(65536)
+            except BlockingIOError:
+                return
+            except Exception as e:
+                log("[SERVER] recv error:", e)
+                return
+            
+            pkt = parse_packet(data)
+            if pkt is None:
+                return
 
-    def pause_writing(self):
-        pass
-
-    def resume_writing(self):
-        pass
-    
+            frag_result = self.fragment_manager.add_fragment(addr, pkt['pkt_id'], pkt['seq'], pkt['payload_len'], pkt['payload'])
+            if frag_result is None:
+                return # waiting for more fragments
+            
+            (seq_keys, payload) = frag_result
+            pkt['payload'] = payload
+            pkt['seq_keys'] = seq_keys
+            
+            t = pkt['msg_type']
+            if t == MESSAGE_TYPES['INIT']:
+                self.handle_init(pkt, addr)
+            elif t == MESSAGE_TYPES['CREATE_ROOM']:
+                self.handle_create_room(pkt, addr)
+            elif t == MESSAGE_TYPES['JOIN_ROOM']:
+                self.handle_join_room(pkt, addr)
+            elif t == MESSAGE_TYPES['LEAVE_ROOM']:
+                self.handle_leave_room(pkt, addr)
+            elif t == MESSAGE_TYPES['LIST_ROOMS']:
+                self.handle_list_rooms(pkt, addr)
+            elif t == MESSAGE_TYPES['EVENT']:
+                self.handle_event(pkt, addr)
+            elif t == MESSAGE_TYPES['UPDATES_ACK']:
+                self.handle_updates_ack(pkt, addr)
+            elif t == MESSAGE_TYPES['SNAPSHOT_ACK']:
+                self.handle_snapshot_ack(pkt, addr)
+            elif t == MESSAGE_TYPES['DISCONNECT']:
+                self.handle_disconnect(pkt, addr)
+            else:
+                # ignore clients won't send INIT_ACK, CREATE_ACK, JOIN_ACK, LIST_ROOMS_ACK, SNAPSHOT or unknown message type
+                pass
+                    
     # === Send helpers ===
     def send(self, msg_type, address, payload=b'', ack=False, repeat=1):
         if ack:
@@ -92,7 +132,10 @@ class ESPServerProtocol:
         pkts, seq_num = build_packet(msg_type, self.pkt_id, self.seq[player_id], payload, snapshot_id)
         for p in pkts:
             for i in range(repeat):
-                self.transport.sendto(p, address)
+                try:
+                    self.sock.sendto(p, address)
+                except Exception:
+                    pass
             if ack:
                 # Save for potential retransmit
                 self.unacked_packets[(self.seq[player_id], player_id)] = {
@@ -121,7 +164,7 @@ class ESPServerProtocol:
             payload = build_init_ack_payload(seq_key, self.next_player_id)
             if not self.send(MESSAGE_TYPES['INIT_ACK'], addr, payload):
                 return
-        print(f"Connected player {self.next_player_id} from {addr}")
+        log(f"Connected player {self.next_player_id} from {addr}")
         self.next_player_id += 1
         self.pkt_id += 1
         
@@ -137,7 +180,7 @@ class ESPServerProtocol:
             if not self.send(MESSAGE_TYPES['CREATE_ACK'], addr, payload):
                 return
                 
-        print(f"Created room {room_id} named '{room_name}'")
+        log(f"Created room {room_id} named '{room_name}'")
         self.next_room_id += 1
         self.pkt_id += 1
         
@@ -195,7 +238,7 @@ class ESPServerProtocol:
                 sent = True
                 
         if sent:
-            print(f"Player {player_id} joined room {room_id} as local id {local_id}")
+            log(f"Player {player_id} joined room {room_id} as local id {local_id}")
             self.pkt_id += 1
     
     def handle_leave_room(self, pkt, addr):
@@ -242,7 +285,7 @@ class ESPServerProtocol:
                 sent = True
         
         if sent:
-            print(f"Player {player_id} left room {room_id}")
+            log(f"Player {player_id} left room {room_id}")
             self.pkt_id += 1
         
     def handle_list_rooms(self, pkt, addr):
@@ -257,7 +300,7 @@ class ESPServerProtocol:
             if not self.send(MESSAGE_TYPES['LIST_ROOMS_ACK'], addr, payload):
                 return
         
-        print(f"Sent room list to {addr}")
+        log(f"Sent room list to {addr}")
         self.pkt_id += 1
         
     def handle_event(self, pkt, addr):
@@ -288,7 +331,7 @@ class ESPServerProtocol:
             if not self.send(MESSAGE_TYPES['EVENT'], address, payload, False, REDUNDANT_K_PACKETS):
                 return
             
-            print(f"Sent event to {address}")
+            log(f"Sent event to {address}")
         else:
             self.update_cell(event_type, room, player_local_id, cell_idx)
             for ld, player in room.players.items():
@@ -300,7 +343,7 @@ class ESPServerProtocol:
                 if not self.send(MESSAGE_TYPES['EVENT'], address, pkt['payload'], False, REDUNDANT_K_PACKETS):
                     continue
                 sent = True
-                print(f"Sent event to {address}")
+                log(f"Sent event to {address}")
         if sent:
             self.pkt_id += 1
         
@@ -399,7 +442,7 @@ class ESPServerProtocol:
         player_id = self.addr_to_player.get(addr)
         if player_id:
             self.cleanup_player(player_id)
-            print(f"Player {player_id} disconnected gracefully")
+            log(f"Player {player_id} disconnected gracefully")
 
     # Helper Methods
     def send_updates_to_all(self):
@@ -415,7 +458,7 @@ class ESPServerProtocol:
                 
                 if not self.send(MESSAGE_TYPES['UPDATES'], self.players[player.global_id].address, payload=payload, ack = True):
                     continue                
-                print(f"Update Sent Player ID:{player.global_id}, Seq_num:{self.seq[player.global_id]}")
+                log(f"Updates Sent Player ID:{player.global_id}, Seq_num:{self.seq[player.global_id]}")
                 sent = True
         if sent:
             self.pkt_id += 1
@@ -432,7 +475,7 @@ class ESPServerProtocol:
             local_id = player.player_local_id
             if local_id in room.players:
                 del room.players[local_id]
-            print(f"Removed player {player_id} (local id {local_id}) from room {room_id}")
+            log(f"Removed player {player_id} (local id {local_id}) from room {room_id}")
 
         # --- 2. Remove mapping ---
         addr = player.address
@@ -444,53 +487,27 @@ class ESPServerProtocol:
         # --- 4. Remove player object ---
         del self.players[player_id]
 
-        print(f"✅ Cleaned up player {player_id}")
+        log(f"✅ Cleaned up player {player_id}")
 
-    # Async Methods
-    async def periodic_updates(self):
-        while True:
-            self.send_updates_to_all()
-            await asyncio.sleep(UPDATES_INTERVAL)
+    def retransmit(self):
+        now = time.time_ns()
+        for (seq, player_id), entry in list(self.unacked_packets.items()):
+            if entry['sent_count'] >= MAX_TRANSMISSION_RETRIES:
+                del self.unacked_packets[(seq, player_id)]
+                continue
+            if now - entry['last_sent'] > int(RETRANS_TIMEOUT * 1e9):
+                pkt_bytes = entry['packet']
+                addr = self.players[player_id].address
+                try:
+                    self.sock.sendto(pkt_bytes, addr)
+                except Exception:
+                    pass
+                entry['last_sent'] = now
+                entry['sent_count'] += 1
 
-    async def periodic_retransmit(self):
-        while True:
-            now = time.time_ns()
-            for (seq, player_id), entry in list(self.unacked_packets.items()):
-                if entry['sent_count'] >= MAX_TRANSMISSION_RETRIES:
-                    del self.unacked_packets[(seq, player_id)]
-                    continue
-                if now - entry['last_sent'] > int(RETRANS_TIMEOUT * 1e9):
-                    pkt_bytes = entry['packet']
-                    addr = self.players[player_id].address
-                    self.transport.sendto(pkt_bytes, addr)
-                    entry['last_sent'] = now
-                    entry['sent_count'] += 1
-                    
-            await asyncio.sleep(0.2)
-    
-    async def cleanup_fragments_periodically(self):
-        while True:
-            self.fragment_manager.cleanup()
-            await asyncio.sleep(1.0)
             
-
-async def run_server(host='127.0.0.1', port=9999):
-    loop = asyncio.get_event_loop()
-    print("Starting server...")
-    transport, proto = await loop.create_datagram_endpoint(lambda: ESPServerProtocol(loop), local_addr=(host, port))
-    # spawn snapshot broadcaster and retransmit loop
-    loop.create_task(proto.periodic_updates())
-    loop.create_task(proto.periodic_retransmit())
-    loop.create_task(proto.cleanup_fragments_periodically())
-    
-    # server runs forever
-    return transport, proto
-
 if __name__ == "__main__":
-    import argparse, asyncio, logging
-
     parser = argparse.ArgumentParser()
-    parser.add_argument("--clients", nargs="+", help="List of client addresses host:port", required=False)
     parser.add_argument("--rate", type=float, default=20.0, help="Snapshot rate (Hz)")
     parser.add_argument("--duration", type=int, help="Run duration (seconds). Omit for continuous run.")
     parser.add_argument("--log", type=str, help="Log file path", required=False)
@@ -498,28 +515,6 @@ if __name__ == "__main__":
     
     if  args.log:
         logging.basicConfig(filename=args.log, level=logging.INFO, format="%(asctime)s %(message)s")
-    print(f"[SERVER] Logging to {args.log}")
-    print(f"[SERVER] Clients: {args.clients or 'None (waiting for clients)'}")
 
-    loop = asyncio.get_event_loop()
-    transport, proto = loop.run_until_complete(run_server())
-
-    # Only stop if duration was given
-    if args.duration:
-        async def stop_after():
-            await asyncio.sleep(args.duration)
-            transport.close()
-            loop.stop()
-            print("[SERVER] Test duration ended, server stopped")
-
-        loop.create_task(stop_after())
-        print(f"[SERVER] Running for {args.duration} seconds...")
-    else:
-        print("[SERVER] Running in continuous mode (Ctrl+C to stop)")
-
-    try:
-        loop.run_forever()
-    except KeyboardInterrupt:
-        print("\n[SERVER] Stopped by user.")
-        transport.close()
-        loop.stop()
+    server = ESPServerProtocol()
+    server.run(args.duration)

@@ -1,16 +1,23 @@
-import asyncio, struct, time, random, zlib
-from collections import defaultdict
+import asyncio, sys, time, random, socket, select
 
 # === Copy shared protocol definitions ===
 from ESP_config import *
 
 # === Client ===
 class ESPClientProtocol:
-    def __init__(self, loop, server_addr):
-        self.loop = loop
+    def __init__(self, server_addr, send_init = True):
         self.server_addr = server_addr
-        self.transport = None
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setblocking(False)
+        
         self.fragment_manager = FragmentManager()
+        
+        self.tasks = {
+            "retransmit": {"interval": 0.2, "last": 0.0, "func": self.retransmit},
+            "check_pending_cells": {"interval": 0.2, "last": 0.0, "func": self.check_pending_cells},
+            "fragment_cleanup": {"interval": 1.0, "last": 0.0, "func": self.fragment_manager.cleanup},
+            "test":{"interval": 3.0, "last": 0.0, "func": self.test_behavior},
+        } 
         
         self.rooms = {}
         self.player_id = None
@@ -28,46 +35,84 @@ class ESPClientProtocol:
         # === Cell ownership ===
         self.pending_cells = {}     # cell_idx -> timestamp when requested
         self.owned_cells = set()    # confirmed cells owned by this player
+        if send_init:
+            self.send_init()
 
-    # === Connection lifecycle ===
-    def connection_made(self, transport):
-        self.transport = transport
-        print(f"[Client] Connected to {self.server_addr}")
-        self.send_init()
+    
+    def run(self, duration=None, test=None):
+        try:
+            log("[Client] Running (Ctrl+C to stop)")
+            start = time.time()
+            while True:
+                if duration and (time.time() - start) >= duration:
+                    log("[Client] Test duration ended, client stopped")
+                    self.disconnect()
+                    
+                # wait for readability up to 0.001ms
+                rlist, _, _ = select.select([self.sock], [], [], 0.001)
 
-    def datagram_received(self, data, addr):
-        pkt = parse_packet(data)
-        if pkt is None:
-            return
+                if rlist:
+                    self.handle_recv()
+                
+                now = time.time()
+                for name, t in self.tasks.items():
+                    if name=="test" and test is None:
+                        continue
+                    
+                    if now - t["last"] >= t["interval"]:
+                        try:
+                            if name=="test":
+                                t["func"](test)
+                            else:
+                                t["func"]()
+                        except Exception as e:
+                            log(f"[Client] {name} error:", e)
+                        t["last"] = now
+                       
+        except KeyboardInterrupt:
+            log("[Client] Stopping by user (Ctrl+C).")
+            self.disconnect()
+            
+    
+    def handle_recv(self):
+        while True:
+            try:
+                data, addr = self.sock.recvfrom(65536)
+            except BlockingIOError:
+                return
+            except Exception as e:
+                log("[SERVER] recv error:", e)
+                return
+                        
+            pkt = parse_packet(data)
+            if pkt is None:
+                return
 
-        frag_result = self.fragment_manager.add_fragment(addr, pkt['pkt_id'], pkt['seq'], pkt['payload_len'], pkt['payload'])
-        if frag_result is None:
-            return # waiting for more fragments
-        
-        (seq_keys, payload) = frag_result
-        pkt['payload'] = payload
-        pkt['seq_keys'] = seq_keys
-        msg_type = pkt['msg_type']
+            frag_result = self.fragment_manager.add_fragment(addr, pkt['pkt_id'], pkt['seq'], pkt['payload_len'], pkt['payload'])
+            if frag_result is None:
+                return # waiting for more fragments
+            
+            (seq_keys, payload) = frag_result
+            pkt['payload'] = payload
+            pkt['seq_keys'] = seq_keys
+            msg_type = pkt['msg_type']
 
-        if msg_type == MESSAGE_TYPES['INIT_ACK']:
-            self.handle_init_ack(payload)
-        elif msg_type == MESSAGE_TYPES['CREATE_ACK']:
-            self.handle_create_ack(payload)
-        elif msg_type == MESSAGE_TYPES['JOIN_ACK']:
-            self.handle_join_ack(payload)
-        elif msg_type == MESSAGE_TYPES['LIST_ROOMS_ACK']:
-            self.handle_list_rooms_ack(payload)
-        elif msg_type == MESSAGE_TYPES['EVENT']:
-            self.handle_event(pkt)
-        elif msg_type == MESSAGE_TYPES['UPDATES']:
-            self.handle_updates(pkt)
-        elif msg_type == MESSAGE_TYPES['SNAPSHOT']:
-            self.handle_snapshot(pkt)
-        else:
-            print(f"[Client] Unknown msg type {msg_type}")
-
-    def connection_lost(self, exc):
-        print("[Client] Connection closed:", exc)
+            if msg_type == MESSAGE_TYPES['INIT_ACK']:
+                self.handle_init_ack(payload)
+            elif msg_type == MESSAGE_TYPES['CREATE_ACK']:
+                self.handle_create_ack(payload)
+            elif msg_type == MESSAGE_TYPES['JOIN_ACK']:
+                self.handle_join_ack(payload)
+            elif msg_type == MESSAGE_TYPES['LIST_ROOMS_ACK']:
+                self.handle_list_rooms_ack(payload)
+            elif msg_type == MESSAGE_TYPES['EVENT']:
+                self.handle_event(pkt)
+            elif msg_type == MESSAGE_TYPES['UPDATES']:
+                self.handle_updates(pkt)
+            elif msg_type == MESSAGE_TYPES['SNAPSHOT']:
+                self.handle_snapshot(pkt)
+            else:
+                log(f"[Client] Unknown msg type {msg_type}")
 
     # === Send helpers ===
     def send(self, msg_type, payload=b'', ack=True, repeat=1):
@@ -80,7 +125,10 @@ class ESPClientProtocol:
         pkts, seq_num = build_packet(msg_type, self.pkt_id, self.seq, payload, self.snapshot_id)
         for p in pkts:
             for i in range(repeat):
-                self.transport.sendto(p, self.server_addr)
+                try:
+                    self.sock.sendto(p, self.server_addr)
+                except Exception:
+                    pass
             if ack:
                 # Save for potential retransmit
                 self.unacked_packets[self.seq] = {
@@ -102,14 +150,14 @@ class ESPClientProtocol:
 
     # === Message Senders ===
     def send_init(self):
-        print("[Client] Sending INIT")
+        log("[Client] Sending INIT")
         self.send(MESSAGE_TYPES['INIT'])
 
     def send_create_room(self, name):
         if not isinstance(name, str):
             return
         payload = build_create_room_payload(name)
-        print(f"[Client] Creating room: {name}")
+        log(f"[Client] Creating room: {name}")
         self.send(MESSAGE_TYPES['CREATE_ROOM'], payload)
 
     def send_join_room(self, room_id):
@@ -117,17 +165,17 @@ class ESPClientProtocol:
             return
         
         payload = build_join_room_payload(room_id)
-        print(f"[Client] Joining room {room_id}")
+        log(f"[Client] Joining room {room_id}")
         self.send(MESSAGE_TYPES['JOIN_ROOM'], payload)
         
     def send_leave_room(self):
         if self.room_id is None:
             return
-        print(f"[Client] Leaving room {self.room_id}")
+        log(f"[Client] Leaving room {self.room_id}")
         self.send(MESSAGE_TYPES['LEAVE_ROOM'])
 
     def send_list_rooms(self):
-        print("[Client] Requesting room list")
+        log("[Client] Requesting room list")
         self.send(MESSAGE_TYPES['LIST_ROOMS'])
 
     def request_cell(self, cell_idx):
@@ -137,7 +185,7 @@ class ESPClientProtocol:
 
         payload = build_event_payload(EVENT_TYPES['CELL_ACQUISITION'], self.room_id, self.local_id, cell_idx)
         self.pending_cells[cell_idx] = time.time_ns()
-        print(f"[Client] Cell {cell_idx} → PENDING (ownership requested)")
+        log(f"[Client] Cell {cell_idx} → PENDING (ownership requested)")
         self.send(MESSAGE_TYPES['EVENT'], payload, False)
         
     def send_updates_ack(self, seq_num):
@@ -153,10 +201,12 @@ class ESPClientProtocol:
         self.send(MESSAGE_TYPES['SNAPSHOT_ACK'], payload, False)
 
     def disconnect(self):
-        print("[Client] Disconnecting...")
+        log("[Client] Disconnecting...")
         self.send(MESSAGE_TYPES['DISCONNECT'])
-        if self.transport:
-            self.transport.close()
+        try:
+            self.sock.close()
+        except Exception:
+            pass
 
     # === Handlers ===
     def handle_init_ack(self, payload):
@@ -166,7 +216,7 @@ class ESPClientProtocol:
             if not self.ack_packet(seq):
                 return
             self.player_id = player_id
-            print(f"[Client] Got player_id = {self.player_id}")
+            log(f"[Client] Got player_id = {self.player_id}")
 
     def handle_create_ack(self, payload):
         res = parse_create_ack_payload(payload)
@@ -175,7 +225,7 @@ class ESPClientProtocol:
             if not self.ack_packet(seq):
                 return
             self.room_id = room_id
-            print(f"[Client] Room created -> id {self.room_id}")
+            log(f"[Client] Room created -> id {self.room_id}")
             self.send_join_room(self.room_id)
     
     
@@ -188,8 +238,8 @@ class ESPClientProtocol:
             self.room_id = room_id
             self.local_id = local_id
             
-            print(f"[Client] Joined room {self.room_id} as local id {self.local_id}")
-            print(f"[Client] Room players: {self.players}")
+            log(f"[Client] Joined room {self.room_id} as local id {self.local_id}")
+            log(f"[Client] Room players: {self.players}")
             
     def handle_leave_ack(self, payload):
         res = parse_join_ack_payload(payload)
@@ -197,7 +247,7 @@ class ESPClientProtocol:
             seq, self.players = res
             if not self.ack_packet(seq):
                 return
-            print(f"[Client] Left room {self.room_id} as local id {self.local_id}")
+            log(f"[Client] Left room {self.room_id} as local id {self.local_id}")
             self.room_id = None
             self.players = {}
             self.local_id = None
@@ -208,9 +258,9 @@ class ESPClientProtocol:
             seq, rooms = res
             if not self.ack_packet(seq):
                 return
-            print(f"[Client] Available Rooms:") 
+            log(f"[Client] Available Rooms:") 
             for rid, (count, name) in rooms.items():
-                print(f" - {rid}: {name} ({count} players)")
+                log(f" - {rid}: {name} ({count} players)")
             self.rooms = rooms
             """
             if self.ui:
@@ -233,7 +283,7 @@ class ESPClientProtocol:
             
             self.grid[cell_idx] = player_local_id
             owner = "you" if player_local_id == self.local_id else f"player {player_local_id}"
-            print(f"[Client] Cell {cell_idx} CONFIRMED for {owner}")
+            log(f"[Client] Cell {cell_idx} CONFIRMED for {owner}")
 
     def handle_event(self, pkt):
         payload = pkt['payload']
@@ -256,7 +306,7 @@ class ESPClientProtocol:
                     
                 self.snapshot_id = pkt['snapshot_id']
                 for seq_key in pkt['seq_keys']: 
-                    print(f"[Client] Update #{self.snapshot_id} seq #{seq_key} received & ACKed")
+                    log(f"[Client] Update #{self.snapshot_id} seq #{seq_key} received & ACKed")
                 
             for seq_key in pkt['seq_keys']:    
                 self.send_updates_ack(seq_key)
@@ -269,98 +319,64 @@ class ESPClientProtocol:
             self.snapshot_id = pkt['snapshot_id']
             for seq_key in pkt['seq_keys']:    
                 self.send_snapshot_ack(seq_key)
-                print(f"[Client] Snapshot #{self.snapshot_id} seq #{seq_key} received & ACKed")
+                log(f"[Client] Snapshot #{self.snapshot_id} seq #{seq_key} received & ACKed")
 
-    # === Background resend task ===
-    async def resend_unacked(self):
-        while True:
-            now = time.time_ns()
-            for seq, info in list(self.unacked_packets.items()):
-                if info['sent_count'] >= MAX_TRANSMISSION_RETRIES:
-                    del self.unacked_packets[seq]
-                    print(f"[Client] Dropping packet seq={seq} after {MAX_TRANSMISSION_RETRIES} retries (no ACK)")
-                    continue
-                
-                if now - info['last_sent'] > int(RETRANS_TIMEOUT * 1e9):
-                    pkt_bytes = info['packet']
-                    self.transport.sendto(pkt_bytes, self.server_addr)
-                    info['last_sent'] = now
-                    info['sent_count'] += 1
-                    print(f"[Client] resent packet seq={seq} ({info['sent_count']}/{MAX_TRANSMISSION_RETRIES})")
+    # === Background retransmit task ===
+    def retransmit(self):
+        now = time.time_ns()
+        for seq, info in list(self.unacked_packets.items()):
+            if info['sent_count'] >= MAX_TRANSMISSION_RETRIES:
+                del self.unacked_packets[seq]
+                log(f"[Client] Dropping packet seq={seq} after {MAX_TRANSMISSION_RETRIES} retries (no ACK)")
+                continue
+            
+            if now - info['last_sent'] > int(RETRANS_TIMEOUT * 1e9):
+                pkt_bytes = info['packet']
+                try:
+                    self.sock.sendto(pkt_bytes, self.server_addr)
+                except Exception:
+                    pass
+                info['last_sent'] = now
+                info['sent_count'] += 1
+                log(f"[Client] resent packet seq={seq} ({info['sent_count']}/{MAX_TRANSMISSION_RETRIES})")
                     
-            await asyncio.sleep(0.5)
 
     # === Background pending timeout cleanup ===
-    async def check_pending_cells(self):
+    def check_pending_cells(self):
         """Remove or retry pending cells that never got confirmed."""
-        while True:
-            now = time.time_ns()
-            for cell_idx, t0 in list(self.pending_cells.items()):
-                if now - t0 > int(RETRANS_TIMEOUT * 1e9):
-                    print(f"[Client] Cell {cell_idx} pending too long → retrying request")
-                    del self.pending_cells[cell_idx]
-                    self.request_cell(cell_idx)
-            await asyncio.sleep(1)
-
-
-def test_create(protocol):
-    protocol.send_create_room(f"Room_{random.randint(100,999)}")
+        now = time.time_ns()
+        for cell_idx, t0 in list(self.pending_cells.items()):
+            if now - t0 > int(RETRANS_TIMEOUT * 1e9):
+                log(f"[Client] Cell {cell_idx} pending too long → retrying request")
+                del self.pending_cells[cell_idx]
+                self.request_cell(cell_idx)
     
-async def test_list(protocol):
-    protocol.send_list_rooms()
-    while not protocol.rooms:
-        await asyncio.sleep(0.5)
     
-    room = 0
-    for room_id, (num_of_players, room_name) in protocol.rooms.items():
-        print(f"[Client] Room ID:{room_id}, Room Name:{room_name}, Num of Players: {num_of_players}")
-        room = room_id
-    protocol.send_join_room(room)
-    
-async def run_test(protocol, test, duration=None):
-    start_time = time.time()
-
-    if test == 0:
-        test_create(protocol)
-    elif test == 1:
-        await test_list(protocol)
+    def test_behavior(self, test):
+        # Handle test 1 auto-join
+        if test == 1 and self.rooms and not self.room_id:
+            first_room = next(iter(self.rooms.keys()))
+            log(f"[Client] Auto-joining room {first_room}")
+            self.send_join_room(first_room)
         
-    while True:
-        if duration and (time.time() - start_time) >= float(duration):
-            print(f"[Client] Test duration {duration}s ended.")
-            break
-        
-        await asyncio.sleep(3)
-        if protocol.room_id and protocol.local_id:
+        # only attempt when in room and has a local_id
+        if self.room_id and self.local_id:
             cell = random.randint(0, TOTAL_CELLS - 1)
-            protocol.request_cell(cell)
-        
-# === Runner ===
-async def run_client(test, duration=None, host="127.0.0.1", port=9999):
-    loop = asyncio.get_event_loop()
-    transport, protocol = await loop.create_datagram_endpoint(
-        lambda: ESPClientProtocol(loop, (host, port)),
-        remote_addr=(host, port)
-    )
-
-    # Start background tasks
-    loop.create_task(protocol.resend_unacked())
-    loop.create_task(protocol.check_pending_cells())
-
-    try:
-        if test is not None:
-            await run_test(protocol, test, duration)
-        else:
-            while True:
-                await asyncio.sleep(3)
-    except KeyboardInterrupt:
-        protocol.disconnect()
-        transport.close()
+            self.request_cell(cell)    
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--test", type=int, help="Choose test sequence", required=False)
-    parser.add_argument("--duration", type=int, help="Choose test sequence", required=False)
+    parser.add_argument("--duration", type=int, help="Test duration in seconds", required=False)
     args = parser.parse_args()
-    asyncio.run(run_client(test=args.test, duration=args.duration))
+    
+    client = ESPClientProtocol(("127.0.0.1", 9999))
+    if args.test is not None:
+        if args.test == 0:
+            client.send_create_room(f"Room_{random.randint(100,999)}")
+        elif args.test == 1:
+            client.send_list_rooms()
+
+    client.run(duration=args.duration, test=args.test)
+    

@@ -488,3 +488,6 @@ def parse_snapshot_ack_payload(payload: bytes):
         return None
     (seq_num,) = struct.unpack(SNAPSHOT_ACK_FMT, payload[:SNAPSHOT_ACK_SIZE])
     return seq_num
+
+def log(*args, **kwargs):
+    print(*args, **kwargs, flush=True)
