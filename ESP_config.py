@@ -103,7 +103,7 @@ EVENT_TYPES = {
 }
 MAX_PACKET = 1200 # bytes
 SNAPSHOT_PAYLOAD_LIMIT = MAX_PACKET - HEADER_SIZE # bytes
-BROADCAST_FREQ_HZ = 20        # 20 snapshots/sec
+BROADCAST_FREQ_HZ = 21        # 21 snapshots/sec
 UPDATES_INTERVAL = 1.0 / BROADCAST_FREQ_HZ
 RETRANS_TIMEOUT = 0.1        # seconds
 REDUNDANT_K_PACKETS = 3      # send K redundant packets
