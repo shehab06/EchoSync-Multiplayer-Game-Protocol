@@ -119,17 +119,18 @@ class ESPServerProtocol:
             return False
         
         player_id = self.addr_to_player.get(address)
+
         if player_id is None:
             return False
-        
+
         if self.seq.get(player_id) is None:
             return False
         
         snapshot_id = 0
         if self.players.get(player_id) is not None and self.rooms.get(self.players.get(player_id).room_id) is not None:
             snapshot_id = self.rooms.get(self.players.get(player_id).room_id).snapshot_id
-        
-        pkts, seq_num = build_packet(msg_type, self.pkt_id, self.seq[player_id], payload, snapshot_id)
+        pkts = build_packet(msg_type, self.pkt_id, self.seq[player_id], payload, snapshot_id)
+
         for p in pkts:
             for i in range(repeat):
                 try:
@@ -144,7 +145,17 @@ class ESPServerProtocol:
                     'msg_type': msg_type,
                     'sent_count': 0
                 }
-        self.seq[player_id] = seq_num
+            
+            if msg_type == MESSAGE_TYPES['UPDATES']:
+                self.metrics_logger.log_snapshot(
+                    client_id=player_id,
+                    snapshot_id=snapshot_id,
+                    seq_num=self.seq[player_id],
+                    server_time=parse_packet(p)['timestamp'],
+                    grid=self.rooms.get(self.players.get(player_id).room_id).grid,
+                )
+                
+            self.seq[player_id] += 1
         
         return True
     
@@ -379,14 +390,6 @@ class ESPServerProtocol:
             pkt = parse_packet(self.unacked_packets[key]['packet'])
             if pkt is None:
                 return
-            recv_time = time.time_ns()
-            self.metrics_logger.log_snapshot(
-                client_id=player_id,
-                snapshot_id=pkt['snapshot_id'],
-                seq_num=seq,
-                server_time=pkt['timestamp'],
-                recv_time=recv_time
-            )
         
         if not self.ack_packet(key): # remove from buffer for this player
             return 
@@ -420,14 +423,6 @@ class ESPServerProtocol:
             pkt = parse_packet(self.unacked_packets[key]['packet'])
             if pkt is None:
                 return
-            recv_time = time.time_ns()
-            self.metrics_logger.log_snapshot(
-                client_id=player_id,
-                snapshot_id=pkt['snapshot_id'],
-                seq_num=seq,
-                server_time=pkt['timestamp'],
-                recv_time=recv_time
-            )
              
         if not self.ack_packet(key): # remove from buffer for this player
             return 
@@ -460,6 +455,7 @@ class ESPServerProtocol:
                     continue                
                 log(f"Updates Sent Player ID:{player.global_id}, Seq_num:{self.seq[player.global_id]}")
                 sent = True
+                
         if sent:
             self.pkt_id += 1
         

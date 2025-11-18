@@ -176,50 +176,74 @@ class FragmentManager:
             del self.fragments[key]
 
 class MetricsLogger:
-    def __init__(self, filename="metrics.csv"):
+    def __init__(self, filename="server_metrics.csv", server_mode=True):
         self.filename = filename
+        self.server_mode = server_mode
         self.last_recv_times = defaultdict(list)  # player_id -> [recv_times]
         self.fieldnames = [
             "client_id", "snapshot_id", "seq_num",
             "server_timestamp_ms", "recv_time_ms",
-            "latency_ms", "jitter_ms",
-            "perceived_position_error", "cpu_percent",
-            "bandwidth_per_client_kbps"
+            "latency_ms", "jitter_ms","grid",
+            "cpu_percent","bandwidth_per_client_kbps"
         ]
+        if self.server_mode:
+            self.fieldnames.remove("recv_time_ms")
+            self.fieldnames.remove("latency_ms")
+            self.fieldnames.remove("jitter_ms")
+            self.fieldnames.remove("bandwidth_per_client_kbps")
+        else:
+            self.fieldnames.remove("cpu_percent")
+            
         # Initialize CSV
-        os.makedirs("results", exist_ok=True)
-        self.file = open(os.path.join("results", filename), "w", newline="")
+        os.makedirs("results_raw", exist_ok=True)
+        self.file = open(os.path.join("results_raw", filename), "w", newline="")
         self.writer = csv.DictWriter(self.file, fieldnames=self.fieldnames)
         self.writer.writeheader()
 
-    def log_snapshot(self, client_id, snapshot_id, seq_num, server_time, recv_time):
-        latency = recv_time - server_time
-        # compute jitter
-        self.last_recv_times[client_id].append(recv_time)
-        recv_times = self.last_recv_times[client_id]
-        jitter = 0.0
-        if len(recv_times) > 1:
-            diffs = [recv_times[i] - recv_times[i - 1] for i in range(1, len(recv_times))]
-            jitter = abs(diffs[-1] - diffs[-2]) if len(diffs) > 1 else diffs[-1]
+    def log_snapshot(self, client_id, snapshot_id, seq_num, server_time, grid, recv_time = None, bytes_received=None):
+        # Convert grid to string
+        grid_str = ",".join(map(str, grid))
 
-        # placeholder for position error (can be updated later)
-        perceived_position_error = random.uniform(0, 0.1)
-        cpu_percent = psutil.cpu_percent(interval=None)
-        bandwidth_per_client_kbps = random.uniform(20, 200)
-
-        self.writer.writerow({
+        # Build row dictionary
+        row = {
             "client_id": client_id,
             "snapshot_id": snapshot_id,
             "seq_num": seq_num,
-            "server_timestamp_ms": int(server_time / 1000000),
-            "recv_time_ms": int(recv_time / 1000000),
-            "latency_ms": int(latency / 1000000),
-            "jitter_ms": int(jitter / 1000000),
-            "perceived_position_error": perceived_position_error,
-            "cpu_percent": cpu_percent,
-            "bandwidth_per_client_kbps": bandwidth_per_client_kbps
-        })
+            "server_timestamp_ms": int(server_time / 1e6),
+            "grid": grid_str,
+        }
+        
+        if  not self.server_mode:
+            if bytes_received is None or recv_time is None:
+                return  # cannot compute client metrics without these
+            
+            # Client
+            latency = recv_time - server_time
+
+            # Compute jitter
+            self.last_recv_times[client_id].append(recv_time)
+            recv_times = self.last_recv_times[client_id]
+            jitter = 0.0
+            if len(recv_times) > 1:
+                diffs = [recv_times[i] - recv_times[i - 1] for i in range(1, len(recv_times))]
+                jitter = abs(diffs[-1] - diffs[-2]) if len(diffs) > 1 else diffs[-1]
+                
+            last_time = recv_times[-2] if len(recv_times) > 1 else server_time
+            interval_s = max((recv_time - last_time) / 1e9, 1e-6)
+            bandwidth_per_client_kbps = (bytes_received * 8) / (interval_s * 1000)
+            
+            row["recv_time_ms"] = int(recv_time / 1e6)
+            row["latency_ms"] = int(latency / 1e6)
+            row['jitter_ms'] = int(jitter / 1e6)
+            row["bandwidth_per_client_kbps"] = bandwidth_per_client_kbps
+        else:
+            # Server: log CPU
+            cpu_percent = psutil.cpu_percent(interval=None)
+            row["cpu_percent"] = cpu_percent
+
+        self.writer.writerow(row)
         self.file.flush()
+
 
 
 """  Helper functions """
@@ -231,7 +255,7 @@ def make_header(msg_type: int, pkt_id: int, seq_num: int, payload_len: int, time
 def compute_checksum(header_bytes: bytes, payload: bytes) -> int:
     return zlib.crc32(header_bytes + payload) & 0xFFFFFFFF
 
-def build_packet(msg_type: int, pkt_id: int, start_seq: int, payload: bytes, snapshot_id: int = 0) -> tuple[list[bytes], int]:
+def build_packet(msg_type: int, pkt_id: int, start_seq: int, payload: bytes, snapshot_id: int = 0) -> list[bytes]:
     packets = []
     max_data = SNAPSHOT_PAYLOAD_LIMIT
 
@@ -252,7 +276,7 @@ def build_packet(msg_type: int, pkt_id: int, start_seq: int, payload: bytes, sna
             pkt_id,
             checksum,
         )
-        return [header], start_seq + 1
+        return [header]
 
     total_frags = (len(payload) + max_data - 1) // max_data
     seq_num = start_seq
@@ -281,7 +305,7 @@ def build_packet(msg_type: int, pkt_id: int, start_seq: int, payload: bytes, sna
         packets.append(header + frag_data)
         seq_num += 1
 
-    return packets, seq_num
+    return packets
 
 def parse_packet(data: bytes):
     # verify minimum size

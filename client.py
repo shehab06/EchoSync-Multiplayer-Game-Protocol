@@ -5,13 +5,15 @@ from ESP_config import *
 
 # === Client ===
 class ESPClientProtocol:
-    def __init__(self, server_addr, send_init = True):
+    def __init__(self, server_addr, metrices_id=None, send_init = True):
         self.server_addr = server_addr
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setblocking(False)
-        
+        metrices_id = metrices_id if metrices_id is not None else random.randint(1000,9999)
         self.fragment_manager = FragmentManager()
-        
+        self.metrics_logger = MetricsLogger(f"client_{metrices_id}_metrics.csv", server_mode=False)
+        self.bytes_received = 0 
+    
         self.tasks = {
             "retransmit": {"interval": 0.2, "last": 0.0, "func": self.retransmit},
             "check_pending_cells": {"interval": 0.2, "last": 0.0, "func": self.check_pending_cells},
@@ -47,6 +49,7 @@ class ESPClientProtocol:
                 if duration and (time.time() - start) >= duration:
                     log("[Client] Test duration ended, client stopped")
                     self.disconnect()
+                    break
                     
                 # wait for readability up to 0.01ms
                 rlist, _, _ = select.select([self.sock], [], [], 0.01)
@@ -72,12 +75,14 @@ class ESPClientProtocol:
         except KeyboardInterrupt:
             log("[Client] Stopping by user (Ctrl+C).")
             self.disconnect()
+            return
             
     
     def handle_recv(self):
         while True:
             try:
                 data, addr = self.sock.recvfrom(65536)
+                self.bytes_received += len(data)
             except BlockingIOError:
                 return
             except Exception as e:
@@ -122,7 +127,7 @@ class ESPClientProtocol:
         if repeat < 1:
             return False
         
-        pkts, seq_num = build_packet(msg_type, self.pkt_id, self.seq, payload, self.snapshot_id)
+        pkts = build_packet(msg_type, self.pkt_id, self.seq, payload, self.snapshot_id)
         for p in pkts:
             for i in range(repeat):
                 try:
@@ -137,7 +142,8 @@ class ESPClientProtocol:
                     'msg_type': msg_type,
                     'sent_count': 0
                 }
-        self.seq = seq_num
+            
+            self.seq += 1
         self.pkt_id += 1
         return True
         
@@ -310,6 +316,16 @@ class ESPClientProtocol:
                 
             for seq_key in pkt['seq_keys']:    
                 self.send_updates_ack(seq_key)
+                recv_time = time.time_ns()
+                self.metrics_logger.log_snapshot(
+                    client_id=self.player_id,
+                    snapshot_id=pkt['snapshot_id'],
+                    seq_num=seq_key,
+                    server_time=pkt['timestamp'],
+                    recv_time=recv_time,
+                    grid=self.grid,
+                    bytes_received=self.bytes_received
+                )
             
     def handle_snapshot(self, pkt):
         payload = pkt['payload']
@@ -367,11 +383,12 @@ class ESPClientProtocol:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
+    parser.add_argument("--metrics_id", type=int, help="Metrics ID for client", required=False)
     parser.add_argument("--test", type=int, help="Choose test sequence", required=False)
     parser.add_argument("--duration", type=int, help="Test duration in seconds", required=False)
     args = parser.parse_args()
     
-    client = ESPClientProtocol(("127.0.0.1", 9999))
+    client = ESPClientProtocol(("127.0.0.1", 9999), metrices_id=args.metrics_id)
     if args.test is not None:
         if args.test == 0:
             client.send_create_room(f"Room_{random.randint(100,999)}")
