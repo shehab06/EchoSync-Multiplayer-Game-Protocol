@@ -108,6 +108,8 @@ class ESPClientProtocol:
                 self.handle_create_ack(payload)
             elif msg_type == MESSAGE_TYPES['JOIN_ACK']:
                 self.handle_join_ack(payload)
+            elif msg_type == MESSAGE_TYPES['LEAVE_ACK']:
+                self.handle_leave_ack(payload)
             elif msg_type == MESSAGE_TYPES['LIST_ROOMS_ACK']:
                 self.handle_list_rooms_ack(payload)
             elif msg_type == MESSAGE_TYPES['EVENT']:
@@ -248,7 +250,7 @@ class ESPClientProtocol:
             log(f"[Client] Room players: {self.players}")
             
     def handle_leave_ack(self, payload):
-        res = parse_join_ack_payload(payload)
+        res = parse_leave_ack_payload(payload)
         if res:
             seq, self.players = res
             if not self.ack_packet(seq):

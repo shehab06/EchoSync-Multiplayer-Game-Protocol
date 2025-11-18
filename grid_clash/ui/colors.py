@@ -1,0 +1,15 @@
+"""
+UI Color definitions
+"""
+from config import *
+
+class Colors:
+    BACKGROUND = GREY
+    PANEL = PANEL_BG
+    TEXT = BLACK
+    TEXT_ACCENT = TEXT_ACCENT
+    BUTTON_NORMAL = BTN_BG
+    BUTTON_HOVER = BTN_HOVER
+    BUTTON_TEXT = BTN_TEXT
+    GRID_EMPTY = LIGHT_GREY
+    GRID_BORDER = BLACK

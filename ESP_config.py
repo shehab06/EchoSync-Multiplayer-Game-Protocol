@@ -110,7 +110,7 @@ REDUNDANT_K_PACKETS = 3      # send K redundant packets
 REDUNDANT_K_UPDATES = 3      # include last K updates per packet
 LAST_K_UPDATES = 10          # max latest updates saved
 MAX_TRANSMISSION_RETRIES = 5 
-REQUIRED_ROOM_PLAYERS = 4
+REQUIRED_ROOM_PLAYERS = 2
 """ Data Structures """
 @dataclass
 class RoomPlayer:

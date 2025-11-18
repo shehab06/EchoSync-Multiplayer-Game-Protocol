@@ -276,6 +276,12 @@ class ESPServerProtocol:
         
         self.players[player_id].room_id = 0
         self.players[player_id].player_local_id = 0
+
+        # # CHECK IF ROOM IS EMPTY AND REMOVE IT
+        # if len(room.players) == 0:
+        #     del self.rooms[room_id]
+        #     log(f"Removed empty room {room_id}")
+        #     return
         
         players = {lid: (p.global_id, p.color) for lid, p in room.players.items()}
         sent = False   
