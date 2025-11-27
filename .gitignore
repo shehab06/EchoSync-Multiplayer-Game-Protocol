@@ -2,6 +2,6 @@
 /old_version
 /logs
 /Documents
-/full_run
+full_run*/
 __pycache__/
 .env

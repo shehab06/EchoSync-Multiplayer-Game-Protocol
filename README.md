@@ -62,7 +62,7 @@ This script will:
 ### 📂 Output Structure
 At the end, you’ll get:
 ```bash
-full_run/<timestamp>/
+full_run_<timestamp>/
 └── <scenario>/                # e.g., baseline, loss2, loss5, delay100
     ├── pcaps/
     │   └── tcpdump_<scenario>.log
