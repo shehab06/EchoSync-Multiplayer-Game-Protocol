@@ -42,19 +42,19 @@ This script will:
 
 - **Install the required libraries**
 - **Run 4 test scenarios: baseline, loss2, loss5, delay100**
-  - **Create test folders in full_run folder**
+  - **Create test folders in full_run_<timestamp> folder**
   - **Run test command**
   - **Start the server**
   - **Start a client** that creates a room with a random name and joins it
   - **Start 3 more clients** and join the created room (total 4 players required to start)
   - **All clients begin clicking cells randomly** to simulate gameplay
   - **Run the test for 60 seconds**
-  - **Collect raw metrics** in `.full_run/{scenario}/results_raw/`
-  - **Generate merged metrics and summarised results** in `.full_run/{scenario}/results/`
-  - **Generate performance plots** in `.full_run/{scenario}/plots/`
-  - **Collect clients and server logs** in `.full_run/{scenario}/logs/`
-  - **Collect PCAP file and logs** in `.full_run/{scenario}/pcaps/`
-  - **Collect NETEM list file** in `.full_run/{scenario}/netem_list.txt`
+  - **Collect raw metrics** in `.full_run_<timestamp>/{scenario}/results_raw/`
+  - **Generate merged metrics and summarised results** in `.full_run_<timestamp>/{scenario}/results/`
+  - **Generate performance plots** in `.full_run_<timestamp>/{scenario}/plots/`
+  - **Collect clients and server logs** in `.full_run_<timestamp>/{scenario}/logs/`
+  - **Collect PCAP file and logs** in `.full_run_<timestamp>/{scenario}/pcaps/`
+  - **Collect NETEM list file** in `.full_run_<timestamp>/{scenario}/netem_list.txt`
 
 
 ---

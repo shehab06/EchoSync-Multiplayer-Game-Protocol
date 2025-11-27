@@ -514,7 +514,8 @@ def parse_snapshot_ack_payload(payload: bytes):
     return seq_num
 
 def log(*args, **kwargs):
-    print(*args, **kwargs, flush=True)
     if logging.getLogger().hasHandlers():
         message = " ".join(str(a) for a in args)
         logging.info(message)
+    else:
+        print(*args, **kwargs, flush=True)
