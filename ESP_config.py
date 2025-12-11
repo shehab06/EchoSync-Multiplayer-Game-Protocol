@@ -179,6 +179,7 @@ class MetricsLogger:
     def __init__(self, filename="server_metrics.csv", server_mode=True):
         self.filename = filename
         self.server_mode = server_mode
+        self.start_time = defaultdict(lambda: None)  # player_id -> start_time
         self.last_recv_times = defaultdict(list)  # player_id -> [recv_times]
         self.fieldnames = [
             "client_id", "snapshot_id", "seq_num",
@@ -228,8 +229,10 @@ class MetricsLogger:
                 diffs = [recv_times[i] - recv_times[i - 1] for i in range(1, len(recv_times))]
                 jitter = abs(diffs[-1] - diffs[-2]) if len(diffs) > 1 else diffs[-1]
                 
-            last_time = recv_times[-2] if len(recv_times) > 1 else server_time
-            interval_s = max((recv_time - last_time) / 1e9, 1e-6)
+            if client_id not in self.start_time:
+                self.start_time[client_id] = recv_time
+                
+            interval_s = max((recv_time - self.start_time[client_id]) / 1e9, 1e-6)
             bandwidth_per_client_kbps = (bytes_received * 8) / (interval_s * 1000)
             
             row["recv_time_ms"] = int(recv_time / 1e6)

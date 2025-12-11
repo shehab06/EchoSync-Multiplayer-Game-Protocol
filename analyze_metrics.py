@@ -123,6 +123,11 @@ avg_updates_per_client = updates_per_client_sec["count"].mean()
 min_updates_per_client = updates_per_client_sec["count"].min()
 max_updates_per_client = updates_per_client_sec["count"].max()
 
+last_bw_per_client = df[df["bandwidth_per_client_kbps"].notna()].groupby("client_id")["bandwidth_per_client_kbps"].last()
+
+# Compute average across clients
+avg_bw_kbps = last_bw_per_client.mean()
+
 def pct95(x): return np.percentile(x.dropna(), 95)
 
 stats = {
@@ -136,7 +141,7 @@ stats = {
     "95th Error": pct95(df["perceived_position_error"]),
     "Avg CPU% (server only)": df[df["cpu_percent"].notna()]["cpu_percent"].mean(),
     "Max CPU% (server only)": df[df["cpu_percent"].notna()]["cpu_percent"].max(),
-    "Avg Bandwidth (kbps per client)": df[df["bandwidth_per_client_kbps"].notna()]["bandwidth_per_client_kbps"].mean(),
+    "Avg Bandwidth (kbps per client)": avg_bw_kbps,
     "Total Packets Logged": len(df),
     "Avg Updates/sec": avg_updates_per_client,
     "Min Updates/sec": min_updates_per_client,
@@ -191,14 +196,18 @@ plt.ylabel("CPU (%)")
 plt.grid(True)
 plt.savefig(os.path.join(plots_dir, "cpu_timeseries.png"))
 
-# Client bandwidth
+# Per Client bandwidth
 plt.figure(figsize=(6,4))
-plt.plot(df[df["bandwidth_per_client_kbps"].notna()]["bandwidth_per_client_kbps"])
+for client_id, group in df[df["bandwidth_per_client_kbps"].notna()].groupby("client_id"):
+    plt.plot(group["timestamp_sec"], group["bandwidth_per_client_kbps"], label=f"Client {client_id}")
+
 plt.title("Per-Client Bandwidth Over Time")
-plt.xlabel("Samples")
-plt.ylabel("kbps")
+plt.xlabel("Time (sec)")
+plt.ylabel("Average Bandwidth (kbps)")
+plt.legend()
 plt.grid(True)
 plt.savefig(os.path.join(plots_dir, "bandwidth_timeseries.png"))
+
 
 # Latency histogram
 plt.figure(figsize=(6,4))
