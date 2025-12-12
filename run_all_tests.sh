@@ -126,6 +126,9 @@ for SCENARIO in "${SCENARIOS[@]}"; do
   echo "[TEST] ✅ $SCENARIO Done. results in $SCEN_DIR"
 done
 
+python3 CompareMetrics.py "$RUN_DIR"
+
+
 # --- Change ownership of all run files back to the user ---
 SUDO_USER=${SUDO_USER:-$(who am i | awk '{print $1}')}
 if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then

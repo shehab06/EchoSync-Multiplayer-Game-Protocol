@@ -220,6 +220,16 @@ plt.ylabel("Jitter (ms)")
 plt.grid(True)
 plt.savefig(os.path.join(plots_dir, "jitter_timeseries.png"))
 
+# Per-client final loss comparison
+plt.figure(figsize=(6,4))
+plt.bar(last_loss_per_client.index.astype(str), last_loss_per_client.values)
+plt.title("Final Loss per Client")
+plt.xlabel("Client ID")
+plt.ylabel("Loss (%)")
+plt.grid(True, axis='y')
+plt.savefig(os.path.join(plots_dir, "per_client_loss.png"))
+
+
 # Server CPU usage
 plt.figure(figsize=(6,4))
 plt.plot(df[df["cpu_percent"].notna()]["cpu_percent"])
@@ -229,17 +239,7 @@ plt.ylabel("CPU (%)")
 plt.grid(True)
 plt.savefig(os.path.join(plots_dir, "cpu_timeseries.png"))
 
-# Per Client bandwidth
-plt.figure(figsize=(6,4))
-for client_id, group in df[df["bandwidth_per_client_kbps"].notna()].groupby("client_id"):
-    plt.plot(group["timestamp_sec"], group["bandwidth_per_client_kbps"], label=f"Client {client_id}")
 
-plt.title("Per-Client Bandwidth Over Time")
-plt.xlabel("Time (sec)")
-plt.ylabel("Average Bandwidth (kbps)")
-plt.legend()
-plt.grid(True)
-plt.savefig(os.path.join(plots_dir, "bandwidth_timeseries.png"))
 
 
 # Latency histogram
@@ -262,6 +262,58 @@ plt.title("Per-Client Update Frequency")
 plt.legend()
 plt.grid(True)
 plt.savefig(os.path.join(plots_dir, "per_client_snapshots.png"))
+
+
+# Position Error vs Loss Rate (1 point per client)
+clients = df["client_id"].unique()
+
+avg_loss_per_client = df.groupby("client_id")["loss"].mean()
+avg_error_per_client = df.groupby("client_id")["perceived_position_error"].mean()
+
+plt.figure(figsize=(6,4))
+plt.scatter(avg_loss_per_client, avg_error_per_client)
+
+for client_id in clients:
+    plt.text(avg_loss_per_client[client_id], avg_error_per_client[client_id], str(client_id),
+             fontsize=9, ha='right', va='bottom')
+
+plt.title("Average Position Error vs Average Loss per Client")
+plt.xlabel("Average Loss (%)")
+plt.ylabel("Average Position Error")
+plt.grid(True)
+plt.savefig(os.path.join(plots_dir, "avg_error_vs_avg_loss_per_client.png"))
+
+
+
+# Compare final bandwidth between clients
+plt.figure(figsize=(6,4))
+plt.bar(last_bw_per_client.index.astype(str), last_bw_per_client.values)
+plt.title("Final Bandwidth per Client")
+plt.xlabel("Client ID")
+plt.ylabel("Bandwidth (kbps)")
+plt.grid(True, axis='y')
+plt.savefig(os.path.join(plots_dir, "per_client_bandwidth.png"))
+
+# Per-client average updates/sec and perceived error
+avg_updates_per_client = updates_per_client_sec.groupby("client_id")["count"].mean().reset_index()
+avg_updates_per_client.columns = ["client_id", "avg_updates_per_sec"]
+
+avg_error_per_client = df.groupby("client_id")["perceived_position_error"].mean().reset_index()
+avg_error_per_client.columns = ["client_id", "avg_error"]
+
+client_error_update = pd.merge(avg_updates_per_client, avg_error_per_client, on="client_id")
+plt.figure(figsize=(6,4))
+plt.scatter(client_error_update["avg_updates_per_sec"], client_error_update["avg_error"])
+for idx, row in client_error_update.iterrows():
+    plt.text(row["avg_updates_per_sec"], row["avg_error"], str(int(row["client_id"])),
+             fontsize=9, ha='right', va='bottom')
+
+plt.xlabel("Average Updates per Second")
+plt.ylabel("Average Perceived Error")
+plt.title("Per-Client Update Rate vs Perceived Error")
+plt.grid(True)
+plt.savefig(os.path.join(plots_dir, "error_vs_update_rate_per_client.png"))
+
 
 print("[ANALYSIS] All plots saved.")
 print("[ANALYSIS] ✅ Analysis complete.")
