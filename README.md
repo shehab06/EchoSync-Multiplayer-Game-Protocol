@@ -91,5 +91,12 @@ full_run_<timestamp>/
     │   ├── bandwidth_timeseries.png
     │   ├── per_client_snapshots.png
     │   └── latency_histogram.png
+    ├── plots/
+    │   ├── compare_mean_latency.png
+    │   ├── compare_mean_jitter.png
+    │   ├── compare_mean_error.png
+    │   ├── compare_avg_cpu.png
+    │   ├── compare_bandwidth_vs_updates.png
+    │   ├── compare_bandwidth_vs_loss.png
     └── netem_list.txt
 ```
