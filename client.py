@@ -16,7 +16,8 @@ class ESPClientProtocol:
             self.metrics_logger = MetricsLogger(f"client_{metrices_id}_metrics.csv", server_mode=False)
         self.bytes_received = 0
         self.packets_received = 0
-        self.last_seq_num = 0
+        self.seen_seq = set()
+
     
         self.tasks = {
             "retransmit": {"interval": 0.2, "last": 0.0, "func": self.retransmit},
@@ -96,18 +97,20 @@ class ESPClientProtocol:
                         
             pkt = parse_packet(data)
             if pkt is None:
-                return
+                continue
+            
+            if pkt['seq'] in self.seen_seq:
+                continue
+            
+            self.seen_seq.add(pkt['seq'])
+            self.packets_received += 1
             
             frag_result = self.fragment_manager.add_fragment(addr, pkt['pkt_id'], pkt['seq'], pkt['payload_len'], pkt['payload'])
             if frag_result is None:
-                return # waiting for more fragments
+                continue # waiting for more fragments
             
             (seq_keys, payload) = frag_result
-            for seq_key in seq_keys:
-                if seq_key > self.last_seq_num:
-                    self.packets_received += 1
-                    
-            self.last_seq_num = max(self.last_seq_num, max(seq_keys))
+            
             
             pkt['payload'] = payload
             pkt['seq_keys'] = seq_keys

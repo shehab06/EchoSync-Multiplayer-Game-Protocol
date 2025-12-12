@@ -13,6 +13,8 @@ class ESPServerProtocol:
         if self.islogging:
             self.metrics_logger = MetricsLogger()
         
+        self.seen_seq = {}  # addr -> set of seen seq numbers
+        
         self.tasks = {
             "broadcast_updates": {"interval": UPDATES_INTERVAL, "last": 0.0, "func": self.send_updates_to_all},
             "retransmit": {"interval": 0.2, "last": 0.0, "func": self.retransmit},
@@ -80,11 +82,16 @@ class ESPServerProtocol:
             
             pkt = parse_packet(data)
             if pkt is None:
-                return
+                continue
+            
+            if pkt['seq'] in self.seen_seq.get(addr, set()):
+                continue
+            
+            self.seen_seq.setdefault(addr, set()).add(pkt['seq'])
 
             frag_result = self.fragment_manager.add_fragment(addr, pkt['pkt_id'], pkt['seq'], pkt['payload_len'], pkt['payload'])
             if frag_result is None:
-                return # waiting for more fragments
+                continue # waiting for more fragments
             
             (seq_keys, payload) = frag_result
             pkt['payload'] = payload
