@@ -83,11 +83,6 @@ class ESPServerProtocol:
             pkt = parse_packet(data)
             if pkt is None:
                 continue
-            
-            if pkt['seq'] in self.seen_seq.get(addr, set()):
-                continue
-            
-            self.seen_seq.setdefault(addr, set()).add(pkt['seq'])
 
             frag_result = self.fragment_manager.add_fragment(addr, pkt['pkt_id'], pkt['seq'], pkt['payload_len'], pkt['payload'])
             if frag_result is None:
@@ -119,6 +114,9 @@ class ESPServerProtocol:
             else:
                 # ignore clients won't send INIT_ACK, CREATE_ACK, JOIN_ACK, LIST_ROOMS_ACK, SNAPSHOT or unknown message type
                 pass
+            
+            if pkt['seq'] not in self.seen_seq.get(addr, set()):
+                self.seen_seq.setdefault(addr, set()).add(pkt['seq'])
                     
     # === Send helpers ===
     def send(self, msg_type, address, payload=b'', ack=False, repeat=1):
@@ -179,33 +177,45 @@ class ESPServerProtocol:
     
     # Handlers
     def handle_init(self, pkt, addr):
-        self.players[self.next_player_id] = PlayerRoomInfo(address=addr, room_id=0, player_local_id=0)
-        self.addr_to_player[addr] = self.next_player_id
-        self.seq[self.next_player_id] = 1
+        
+        if addr not in self.addr_to_player:
+            self.players[self.next_player_id] = PlayerRoomInfo(address=addr, room_id=0, player_local_id=0)
+            self.addr_to_player[addr] = self.next_player_id
+            self.seq[self.next_player_id] = 1
+            log(f"[SERVER] Connected player {self.next_player_id} from {addr}")
+            self.next_player_id += 1
+            self.pkt_id += 1
+        
+        player_id = self.addr_to_player[addr]
+
         for seq_key in pkt['seq_keys']:
-            payload = build_init_ack_payload(seq_key, self.next_player_id)
+            payload = build_init_ack_payload(seq_key, player_id)
             if not self.send(MESSAGE_TYPES['INIT_ACK'], addr, payload):
                 return
-        log(f"[SERVER] Connected player {self.next_player_id} from {addr}")
-        self.next_player_id += 1
-        self.pkt_id += 1
-        
+          
     def handle_create_room(self, pkt, addr):
         room_name = parse_create_room_payload(pkt['payload'])
         if room_name is None:
             return
         
-        room_id = self.next_room_id
-        self.rooms[room_id] = Room(room_id=room_id, name=room_name)
+        room_id = None
+        for room in self.rooms.values():
+            if room.name == room_name:
+                room_id = room.room_id
+                break
+                
+        if room_id is None:
+            room_id = self.next_room_id
+            self.rooms[room_id] = Room(room_id=room_id, name=room_name)
+            log(f"[SERVER] Created room {room_id} named '{room_name}'")
+            self.next_room_id += 1
+            self.pkt_id += 1
+            
         for seq_key in pkt['seq_keys']:
             payload = build_create_ack_payload(seq_key, room_id)
             if not self.send(MESSAGE_TYPES['CREATE_ACK'], addr, payload):
                 return
                 
-        log(f"[SERVER] Created room {room_id} named '{room_name}'")
-        self.next_room_id += 1
-        self.pkt_id += 1
-        
     def handle_join_room(self, pkt, addr):
         room_id = parse_join_room_payload(pkt['payload'])
         if room_id is None:
@@ -223,7 +233,16 @@ class ESPServerProtocol:
         seq = self.seq.get(player_id)
         if seq is None:
             return
-            
+        
+        in_room = self.players.get(player_id).room_id == room_id
+        if in_room:
+            for seq_key in pkt['seq_keys']:
+                payload = build_join_ack_payload(seq_key, room_id, local_id, players)
+                if not self.send(MESSAGE_TYPES['JOIN_ACK'], addr, payload, False, REDUNDANT_K_PACKETS):
+                    break
+                log(f"[SERVER] Sent join ack for player {player_id} as local id {local_id}")
+            return
+        
         # assign local id
         used_ids = set(room.players.keys())
         for local_id in range(1, REQUIRED_ROOM_PLAYERS + 1):
@@ -287,6 +306,16 @@ class ESPServerProtocol:
         if room is None:
             return
         
+        in_room = self.players.get(player_id).room_id == room_id
+        
+        if not in_room:
+            players = {lid: (p.global_id, p.color) for lid, p in room.players.items()}
+            for seq_key in pkt['seq_keys']:
+                payload = build_leave_ack_payload(seq_key, players)
+                if not self.send(MESSAGE_TYPES['LEAVE_ACK'], addr, payload, False, REDUNDANT_K_PACKETS):
+                    break
+            return
+        
         local_id = self.players[player_id].player_local_id
         if local_id in room.players:
             del room.players[local_id]
@@ -345,7 +374,7 @@ class ESPServerProtocol:
         # ONLY AFTER sending acks, remove empty room
         if room_empty:
             del self.rooms[room_id]
-            log(f"Removed empty room {room_id}")
+            log(f"[SERVER] Removed empty room {room_id}")
         
     def handle_list_rooms(self, pkt, addr):
         player_id = self.addr_to_player.get(addr)
@@ -392,6 +421,19 @@ class ESPServerProtocol:
             
             log(f"[SERVER] Sent Ignore Event (players < required number of room players) to {address}")
         else:
+            check_duplicates = any(seq for seq in pkt['seq_keys'] if seq in self.seen_seq.get(addr, set()))
+            if check_duplicates:
+                player_info = self.players.get(player_id) 
+                if player_info is None:
+                    return
+                
+                address = player_info.address
+                if not self.send(MESSAGE_TYPES['EVENT'], address, pkt['payload'], False, REDUNDANT_K_PACKETS):
+                    return
+                
+                log(f"[SERVER] Sent Event (Type: {event_type}, Room (ID:{room.room_id}, Name: {room.name}), Player local id:{player_local_id}, Cell index:{cell_idx}) to {address}")
+                return
+            
             self.update_cell(event_type, room, player_local_id, cell_idx)
             for ld, player in room.players.items():
                 player_info = self.players.get(player.global_id) 

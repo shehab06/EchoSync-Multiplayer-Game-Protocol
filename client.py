@@ -98,12 +98,7 @@ class ESPClientProtocol:
             pkt = parse_packet(data)
             if pkt is None:
                 continue
-            
-            if pkt['seq'] in self.seen_seq:
-                continue
-            
-            self.seen_seq.add(pkt['seq'])
-            self.packets_received += 1
+
             
             frag_result = self.fragment_manager.add_fragment(addr, pkt['pkt_id'], pkt['seq'], pkt['payload_len'], pkt['payload'])
             if frag_result is None:
@@ -134,6 +129,10 @@ class ESPClientProtocol:
                 self.handle_snapshot(pkt)
             else:
                 log(f"[Client] Unknown msg type {msg_type}")
+                
+            if pkt['seq'] not in self.seen_seq:
+                self.packets_received += 1
+                self.seen_seq.add(pkt['seq'])
 
     # === Send helpers ===
     def send(self, msg_type, payload=b'', ack=True, repeat=1):
@@ -251,7 +250,6 @@ class ESPClientProtocol:
             log(f"[Client] Room created -> id {self.room_id}")
             self.send_join_room(self.room_id)
     
-    
     def handle_join_ack(self, payload):
         res = parse_join_ack_payload(payload)
         if res:
@@ -349,7 +347,7 @@ class ESPClientProtocol:
                         recv_time=recv_time,
                         positions=self.positions if self.positions else "",
                         bytes_received=self.bytes_received,
-                        loss=abs(seq_key - self.packets_received) / max(1, seq_key)
+                        loss=abs(seq_key - (self.packets_received+1)) / max(1, seq_key)
                     )
             
     def handle_snapshot(self, pkt):

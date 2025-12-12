@@ -91,6 +91,10 @@ print("[merge] Joined rows:", len(merged))
 # ----------------------------------------------------------
 def compute_error(server_positions, client_positions):
     errors = []
+    
+    if not isinstance(server_positions, dict) or not isinstance(client_positions, dict):
+        return float('nan')
+    
     for pid, spos in server_positions.items():
         if pid not in client_positions:
             continue
@@ -107,7 +111,7 @@ def compute_error(server_positions, client_positions):
     return sum(errors) / len(errors)
 
 merged["perceived_position_error"] = merged.apply(
-    lambda r: compute_error(r["positions_client"], r["positions_server"]),
+    lambda r: compute_error(r["positions_server"], r["positions_client"]),
     axis=1
 )
 
