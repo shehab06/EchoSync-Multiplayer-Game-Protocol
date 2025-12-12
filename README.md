@@ -99,5 +99,5 @@ full_run_<timestamp>/
     │   ├── compare_mean_error.png
     │   ├── compare_avg_cpu.png
     │   ├── compare_bandwidth_vs_updates.png
-    │ └── compare_bandwidth_vs_loss.png
+    │   └── compare_bandwidth_vs_loss.png
 ```
