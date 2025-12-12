@@ -185,14 +185,13 @@ class MetricsLogger:
             "client_id", "snapshot_id", "seq_num",
             "server_timestamp_ms", "recv_time_ms",
             "latency_ms", "jitter_ms","positions",
-            "cpu_percent","bandwidth_per_client_kbps", "loss"
+            "cpu_percent","bandwidth_per_client_kbps"
         ]
         if self.server_mode:
             self.fieldnames.remove("recv_time_ms")
             self.fieldnames.remove("latency_ms")
             self.fieldnames.remove("jitter_ms")
             self.fieldnames.remove("bandwidth_per_client_kbps")
-            self.fieldnames.remove("loss")
         else:
             self.fieldnames.remove("cpu_percent")
             
@@ -208,7 +207,7 @@ class MetricsLogger:
         return ";".join(f"{pid},{x},{y}" for pid, (x, y) in positions.items())
 
 
-    def log_snapshot(self, client_id, snapshot_id, seq_num, server_time, positions, recv_time = None, bytes_received=None, loss=None):
+    def log_snapshot(self, client_id, snapshot_id, seq_num, server_time, positions, recv_time = None, bytes_received=None):
     
         # Build row dictionary
         row = {
@@ -244,7 +243,6 @@ class MetricsLogger:
             row["latency_ms"] = int(latency / 1e6)
             row['jitter_ms'] = int(jitter / 1e6)
             row["bandwidth_per_client_kbps"] = bandwidth_per_client_kbps
-            row["loss"] = loss if loss is not None else 0
         else:
             # Server: log CPU
             cpu_percent = psutil.cpu_percent(interval=None)
