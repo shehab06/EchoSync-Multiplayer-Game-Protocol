@@ -55,7 +55,7 @@ This script will:
   - **Collect clients and server logs** in `.full_run_<timestamp>/{scenario}/logs/`
   - **Collect PCAP file and logs** in `.full_run_<timestamp>/{scenario}/pcaps/`
   - **Collect NETEM list file** in `.full_run_<timestamp>/{scenario}/netem_list.txt`
-  - **Collect NETEM list file** in `.full_run_<timestamp>/{scenario}/netem_list.txt`
+  - **Generate tests comparison plots** in `.full_run_<timestamp>/plots/`
 
 
 ---
