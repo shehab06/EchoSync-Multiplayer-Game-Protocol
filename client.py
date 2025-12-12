@@ -340,6 +340,7 @@ class ESPClientProtocol:
                         recv_time=recv_time,
                         positions=self.positions if self.positions else "",
                         bytes_received=self.bytes_received,
+                        loss=abs(seq_key - self.packets_received) / max(1, seq_key)
                     )
             
     def handle_snapshot(self, pkt):
