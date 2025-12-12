@@ -55,6 +55,7 @@ This script will:
   - **Collect clients and server logs** in `.full_run_<timestamp>/{scenario}/logs/`
   - **Collect PCAP file and logs** in `.full_run_<timestamp>/{scenario}/pcaps/`
   - **Collect NETEM list file** in `.full_run_<timestamp>/{scenario}/netem_list.txt`
+  - **Collect NETEM list file** in `.full_run_<timestamp>/{scenario}/netem_list.txt`
 
 
 ---
@@ -91,12 +92,12 @@ full_run_<timestamp>/
     │   ├── bandwidth_timeseries.png
     │   ├── per_client_snapshots.png
     │   └── latency_histogram.png
-    ├── plots/
+    └── netem_list.txt
+└── plots/
     │   ├── compare_mean_latency.png
     │   ├── compare_mean_jitter.png
     │   ├── compare_mean_error.png
     │   ├── compare_avg_cpu.png
     │   ├── compare_bandwidth_vs_updates.png
-    │   ├── compare_bandwidth_vs_loss.png
-    └── netem_list.txt
+    │ └── compare_bandwidth_vs_loss.png
 ```
