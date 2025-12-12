@@ -14,7 +14,8 @@ class ESPClientProtocol:
         self.islogging = islogging
         if self.islogging:
             self.metrics_logger = MetricsLogger(f"client_{metrices_id}_metrics.csv", server_mode=False)
-        self.bytes_received = 0 
+        self.bytes_received = 0
+        self.packets_received = 0
     
         self.tasks = {
             "retransmit": {"interval": 0.2, "last": 0.0, "func": self.retransmit},
@@ -31,6 +32,7 @@ class ESPClientProtocol:
         self.room_id = None
         self.local_id = None
         self.grid = [0] * TOTAL_CELLS
+        self.positions = {} # player_id -> (x,y)
 
         # === Reliability ===
         self.unacked_packets = {}   # seq -> {'packet': bytes, 'last_sent': time.time_ns(), 'msg_type': int, 'sent_count':int}
@@ -85,6 +87,7 @@ class ESPClientProtocol:
             try:
                 data, addr = self.sock.recvfrom(65536)
                 self.bytes_received += len(data)
+                self.packets_received += 1
             except BlockingIOError:
                 return
             except Exception as e:
@@ -213,6 +216,7 @@ class ESPClientProtocol:
     def disconnect(self):
         log(f"[Client] Disconnecting...")
         self.send(MESSAGE_TYPES['DISCONNECT'])
+            
         try:
             self.sock.close()
         except Exception:
@@ -294,6 +298,9 @@ class ESPClientProtocol:
                 self.owned_cells.add(cell_idx)
             
             self.grid[cell_idx] = player_local_id
+            x = cell_idx % GRID_N
+            y = cell_idx // GRID_N
+            self.positions[player_local_id] = (x, y)
             owner = "you" if player_local_id == self.local_id else f"player {player_local_id}"
             log(f"[Client] Cell {cell_idx} CONFIRMED for {owner}")
 
@@ -331,8 +338,9 @@ class ESPClientProtocol:
                         seq_num=seq_key,
                         server_time=pkt['timestamp'],
                         recv_time=recv_time,
-                        grid=self.grid,
-                        bytes_received=self.bytes_received
+                        positions=self.positions if self.positions else "",
+                        bytes_received=self.bytes_received,
+                        loss=abs(seq_key - self.packets_received) / max(1, seq_key)
                     )
             
     def handle_snapshot(self, pkt):

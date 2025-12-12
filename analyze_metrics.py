@@ -3,6 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 import json
+import math
 
 results_dir = "./results_raw"
 merged_path = "./results/metrics.csv"
@@ -34,9 +35,9 @@ client_df = pd.concat(client_frames, ignore_index=True)
 print(f"[merge] Server rows: {len(server_df)}, Client rows: {len(client_df)}")
 
 # --- Normalize missing columns ---
-for c in ["client_id","seq_num","snapshot_id","server_timestamp_ms","grid","cpu_percent"]:
+for c in ["client_id","seq_num","snapshot_id","server_timestamp_ms","positions","cpu_percent"]:
     if c not in server_df: server_df[c] = np.nan
-for c in ["client_id","seq_num","snapshot_id","server_timestamp_ms","grid",
+for c in ["client_id","seq_num","snapshot_id","server_timestamp_ms","positions",
           "latency_ms","jitter_ms","bandwidth_per_client_kbps"]:
     if c not in client_df: client_df[c] = np.nan
 
@@ -52,8 +53,25 @@ def decode_grid(g):
         except:
             return None
 
-server_df["grid"] = server_df["grid"].apply(decode_grid)
-client_df["grid"] = client_df["grid"].apply(decode_grid)
+def csv_to_positions(csv_str):
+    if pd.isna(csv_str) or not str(csv_str).strip():
+        return {}  # empty CSV
+    
+    positions = {}
+    
+    items = csv_str.split(";")
+    for item in items:
+        pid_str, x_str, y_str = item.split(",")
+        pid = int(pid_str)
+        x = int(x_str)
+        y = int(y_str)
+        positions[pid] = (x, y)
+
+    return positions
+
+
+server_df["positions"] = server_df["positions"].apply(csv_to_positions)
+client_df["positions"] = client_df["positions"].apply(csv_to_positions)
 
 # ----------------------------------------------------------
 #  JOIN: server + client on (client_id, seq_num, snapshot_id)
@@ -71,20 +89,30 @@ print("[merge] Joined rows:", len(merged))
 # ----------------------------------------------------------
 #  COMPUTE PERCEIVED POSITION ERROR
 # ----------------------------------------------------------
-def compute_error(cg, sg):
-    if cg is None or sg is None:
-        return np.nan
-    if len(cg) != len(sg):
-        return np.nan
-    return sum(1 for a,b in zip(cg,sg) if a != b)
+def compute_error(server_positions, client_positions):
+    errors = []
+    for pid, spos in server_positions.items():
+        if pid not in client_positions:
+            continue
+
+        cx, cy = client_positions[pid]
+        sx, sy = spos
+
+        d = math.sqrt((cx - sx)**2 + (cy - sy)**2)
+        errors.append(d)
+
+    if not errors:
+        return float('nan')
+
+    return sum(errors) / len(errors)
 
 merged["perceived_position_error"] = merged.apply(
-    lambda r: compute_error(r["grid_client"], r["grid_server"]),
+    lambda r: compute_error(r["positions_client"], r["positions_server"]),
     axis=1
 )
 
-# Drop grids to reduce file size
-merged = merged.drop(columns=["grid_client", "grid_server"])
+# Drop positions to reduce file size
+merged = merged.drop(columns=["positions_client", "positions_server"])
 
 # Ensure server timestamp is consistent
 if "server_timestamp_ms_client" in merged.columns and "server_timestamp_ms_server" in merged.columns:
@@ -104,7 +132,7 @@ print(f"[merge] Final merged file saved at: {merged_path}")
 df = merged.copy()
 
 # Convert numeric columns
-cols_to_numeric = ["latency_ms", "jitter_ms", "perceived_position_error", "cpu_percent", "bandwidth_per_client_kbps"]
+cols_to_numeric = ["latency_ms", "jitter_ms", "perceived_position_error", "cpu_percent", "bandwidth_per_client_kbps", "loss"]
 for c in cols_to_numeric:
     df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -128,6 +156,10 @@ last_bw_per_client = df[df["bandwidth_per_client_kbps"].notna()].groupby("client
 # Compute average across clients
 avg_bw_kbps = last_bw_per_client.mean()
 
+last_loss_per_client = df[df["loss"].notna()].groupby("client_id")["loss"].last()
+avg_loss = last_loss_per_client.mean()
+
+
 def pct95(x): return np.percentile(x.dropna(), 95)
 
 stats = {
@@ -145,7 +177,8 @@ stats = {
     "Total Packets Logged": len(df),
     "Avg Updates/sec": avg_updates_per_client,
     "Min Updates/sec": min_updates_per_client,
-    "Max Updates/sec": max_updates_per_client
+    "Max Updates/sec": max_updates_per_client,
+    "Avg Loss (%)": avg_loss if "loss" in df.columns else float('nan'),
 }
 
 print("\n[ANALYSIS] === Final Metrics Summary ===")

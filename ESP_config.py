@@ -184,14 +184,15 @@ class MetricsLogger:
         self.fieldnames = [
             "client_id", "snapshot_id", "seq_num",
             "server_timestamp_ms", "recv_time_ms",
-            "latency_ms", "jitter_ms","grid",
-            "cpu_percent","bandwidth_per_client_kbps"
+            "latency_ms", "jitter_ms","positions",
+            "cpu_percent","bandwidth_per_client_kbps", "loss"
         ]
         if self.server_mode:
             self.fieldnames.remove("recv_time_ms")
             self.fieldnames.remove("latency_ms")
             self.fieldnames.remove("jitter_ms")
             self.fieldnames.remove("bandwidth_per_client_kbps")
+            self.fieldnames.remove("loss")
         else:
             self.fieldnames.remove("cpu_percent")
             
@@ -200,18 +201,22 @@ class MetricsLogger:
         self.file = open(os.path.join("results_raw", filename), "w", newline="")
         self.writer = csv.DictWriter(self.file, fieldnames=self.fieldnames)
         self.writer.writeheader()
+    
+    def positions_to_csv(self, positions):
+        if not positions:
+            return ""
+        return ";".join(f"{pid},{x},{y}" for pid, (x, y) in positions.items())
 
-    def log_snapshot(self, client_id, snapshot_id, seq_num, server_time, grid, recv_time = None, bytes_received=None):
-        # Convert grid to string
-        grid_str = ",".join(map(str, grid))
 
+    def log_snapshot(self, client_id, snapshot_id, seq_num, server_time, positions, recv_time = None, bytes_received=None, loss=None):
+    
         # Build row dictionary
         row = {
             "client_id": client_id,
             "snapshot_id": snapshot_id,
             "seq_num": seq_num,
             "server_timestamp_ms": int(server_time / 1e6),
-            "grid": grid_str,
+            "positions": self.positions_to_csv(positions),
         }
         
         if  not self.server_mode:
@@ -239,6 +244,7 @@ class MetricsLogger:
             row["latency_ms"] = int(latency / 1e6)
             row['jitter_ms'] = int(jitter / 1e6)
             row["bandwidth_per_client_kbps"] = bandwidth_per_client_kbps
+            row["loss"] = loss if loss is not None else 0
         else:
             # Server: log CPU
             cpu_percent = psutil.cpu_percent(interval=None)

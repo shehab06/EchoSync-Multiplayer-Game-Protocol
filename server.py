@@ -25,6 +25,7 @@ class ESPServerProtocol:
         
         self.next_room_id = 1
         self.rooms: Dict[int, Room] = {}  # room_id -> Room
+        self.rooms_positions = {} # room_id -> {player_id -> (x,y)}
         
         self.pkt_id = 1
         self.seq: Dict[int, int] = {} 
@@ -155,7 +156,7 @@ class ESPServerProtocol:
                         snapshot_id=snapshot_id,
                         seq_num=self.seq[player_id],
                         server_time=parse_packet(p)['timestamp'],
-                        grid=self.rooms.get(self.players.get(player_id).room_id).grid,
+                        positions=self.rooms_positions.get(self.players.get(player_id).room_id, ""),
                     )
                 
             self.seq[player_id] += 1
@@ -290,6 +291,10 @@ class ESPServerProtocol:
         for i in range(len(room.grid)):
             if room.grid[i] == local_id:
                 room.grid[i] = 0  # Free the cell
+                
+        if room_id in self.rooms_positions and local_id in self.rooms_positions[room_id]:
+            del self.rooms_positions[room_id][local_id]
+                
         
         # remove their events from the room updates
         room.updates = deque([update for update in room.updates if update[1] != local_id], 
@@ -403,6 +408,11 @@ class ESPServerProtocol:
             if room.grid[cell_idx] != 0:
                 return
             room.grid[cell_idx] = player_local_id
+            x = cell_idx % GRID_N
+            y = cell_idx // GRID_N
+            if room.room_id not in self.rooms_positions:
+                self.rooms_positions[room.room_id] = {}
+            self.rooms_positions[room.room_id][player_local_id] = (x, y)
             
         room.snapshot_id += 1
         room.updates.append((event_type, player_local_id, cell_idx))
