@@ -236,11 +236,12 @@ class ESPServerProtocol:
         
         in_room = self.players.get(player_id).room_id == room_id
         if in_room:
+            players = {lid: (p.global_id, p.color) for lid, p in room.players.items()}
             for seq_key in pkt['seq_keys']:
-                payload = build_join_ack_payload(seq_key, room_id, local_id, players)
+                payload = build_join_ack_payload(seq_key, room_id, self.players[player_id].player_local_id, players)
                 if not self.send(MESSAGE_TYPES['JOIN_ACK'], addr, payload, False, REDUNDANT_K_PACKETS):
                     break
-                log(f"[SERVER] Sent join ack for player {player_id} as local id {local_id}")
+                log(f"[SERVER] Sent join ack for player {player_id} as local id {self.players[player_id].player_local_id}")
             return
         
         # assign local id
@@ -586,15 +587,26 @@ class ESPServerProtocol:
             if entry['sent_count'] >= MAX_TRANSMISSION_RETRIES:
                 del self.unacked_packets[(seq, player_id)]
                 continue
+
             if now - entry['last_sent'] > int(RETRANS_TIMEOUT * 1e9):
+                # Skip if player disconnected
+                player = self.players.get(player_id)
+                if not player:
+                    # Optionally log or silently ignore
+                    log(f"[SERVER] Retransmit skipped: player {player_id} disconnected")
+                    del self.unacked_packets[(seq, player_id)]
+                    continue
+
                 pkt_bytes = entry['packet']
-                addr = self.players[player_id].address
+                addr = player.address
                 try:
                     self.sock.sendto(pkt_bytes, addr)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log(f"[SERVER] Retransmit failed for player {player_id}: {e}")
+
                 entry['last_sent'] = now
                 entry['sent_count'] += 1
+
 
             
 if __name__ == "__main__":
